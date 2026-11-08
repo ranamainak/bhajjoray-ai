@@ -1,8 +1,5 @@
---extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
-transformers
-torch
-accelerate
 pydantic
 huggingface_hub
+llama-cpp-python
