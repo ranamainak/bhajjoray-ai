@@ -293,9 +293,10 @@ def _podcast_system_prompt(language: str, reference: str) -> str:
         "If the supplied meaning is limited, explain it clearly without pretending "
         "that missing commentary was supplied. "
         "REFERENCE SAFETY: The exact chapter and verse reference is returned in API "
-        "metadata. Do not say a chapter number or verse number aloud in the narration. "
-        "You may say 'today's shloka' or 'this verse'. This prevents incorrect spoken "
-        "ordinal numbers. "
+        "metadata. Prefer to say 'today's shloka' or 'this verse' rather than speaking "
+        "the reference. If you do mention a chapter or verse in words, it must match "
+        "the supplied reference exactly; never guess or approximate it. Never state "
+        "chapter or verse numbers using digits. "
         "AUDIO STRUCTURE: Use five natural sections in connected paragraphs: a brief "
         "welcome and topic; the source-grounded meaning; the key practical insight; "
         "one relevant everyday example; and one practical application followed by "
@@ -385,16 +386,45 @@ def _podcast_quality_issues(
     if language == "Hindi":
         if letter_count == 0 or devanagari_count / letter_count < 0.65:
             issues.append("not_predominantly_hindi_devanagari")
-        # Chapter/verse identifiers are supplied in metadata. Catch common
-        # ordinal-number mistakes such as 'दूसरे अध्याय के चौथें श्लोक'.
-        hindi_number_words = (
-            "पहले|दूसरे|तीसरे|चौथे|चौथें|पाँचवें|पांचवें|छठे|सातवें|"
-            "आठवें|नौवें|दसवें|ग्यारहवें|बारहवें|सैंतालीसवें|सैंतालीसवाँ"
+        # Validate spoken Hindi ordinal references against the supplied source.
+        # The previous generic rule rejected even a correct phrase such as
+        # 'दूसरे अध्याय' for source reference Bhagavad Gita 2.47.
+        hindi_ordinal_values = {
+            "पहला": 1, "पहले": 1, "पहली": 1,
+            "दूसरा": 2, "दूसरे": 2, "दूसरी": 2,
+            "तीसरा": 3, "तीसरे": 3, "तीसरी": 3,
+            "चौथा": 4, "चौथे": 4, "चौथें": 4, "चौथी": 4,
+            "पाँचवाँ": 5, "पाँचवें": 5, "पाँचवीं": 5,
+            "पांचवां": 5, "पांचवें": 5, "पांचवीं": 5,
+            "छठा": 6, "छठे": 6, "छठी": 6,
+            "सातवाँ": 7, "सातवें": 7, "सातवीं": 7,
+            "आठवाँ": 8, "आठवें": 8, "आठवीं": 8,
+            "नौवाँ": 9, "नौवें": 9, "नौवीं": 9,
+            "दसवाँ": 10, "दसवें": 10, "दसवीं": 10,
+            "ग्यारहवाँ": 11, "ग्यारहवें": 11, "ग्यारहवीं": 11,
+            "बारहवाँ": 12, "बारहवें": 12, "बारहवीं": 12,
+            "सैंतालीसवाँ": 47, "सैंतालीसवें": 47, "सैंतालीसवीं": 47,
+        }
+        source_numbers = re.search(
+            r"(?<!\d)(\d{1,2})\s*[.:/-]\s*(\d{1,3})(?!\d)",
+            payload.shloka_reference,
         )
-        if re.search(rf"(?:{hindi_number_words})\s+अध्याय", script) or re.search(
-            rf"अध्याय.{0,45}(?:{hindi_number_words})\s+श्लोक", script
-        ):
-            issues.append("spoken_chapter_verse_number_may_be_inaccurate")
+        if source_numbers:
+            expected_chapter, expected_verse = map(int, source_numbers.groups())
+            ordinal_pattern = "|".join(
+                re.escape(word)
+                for word in sorted(hindi_ordinal_values, key=len, reverse=True)
+            )
+            spoken_chapters = re.findall(
+                rf"({ordinal_pattern})\s+अध्याय", script
+            )
+            spoken_verses = re.findall(
+                rf"({ordinal_pattern})\s+श्लोक", script
+            )
+            if any(hindi_ordinal_values[word] != expected_chapter for word in spoken_chapters):
+                issues.append("spoken_chapter_reference_does_not_match_source")
+            if any(hindi_ordinal_values[word] != expected_verse for word in spoken_verses):
+                issues.append("spoken_verse_reference_does_not_match_source")
         if re.search(r"अध्याय\s*[0-9०-९]+|श्लोक\s*[0-9०-९]+", script):
             issues.append("spoken_numeric_reference_not_allowed")
     else:
