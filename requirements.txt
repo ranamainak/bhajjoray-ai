@@ -3,4 +3,4 @@ fastapi
 uvicorn
 pydantic
 huggingface_hub
-llama-cpp-python
+llama-cpp-python==0.3.36
