@@ -28,7 +28,7 @@ FESTIVAL_DB = {
     "2026-11-08": "Diwali / Laxmi Puja",
 }
 
-app = FastAPI(title="Bhajjoray AI", version="2.1.0")
+app = FastAPI(title="Bhajjoray AI", version="2.2.0")
 
 # One shared model instance and serial inference protect the 4-vCPU / 8-GB container.
 MODEL_LOCK = threading.Lock()
@@ -185,151 +185,254 @@ def _memory_stats() -> dict:
     return stats
 
 
-def _podcast_system_prompt(language: str) -> str:
+def _is_gita_2_47(reference: str) -> bool:
+    """Identify Bhagavad Gita 2.47 without imposing its meaning on other verses."""
+    normalized = re.sub(r"\s+", " ", reference.strip().lower())
+    return bool(re.search(r"(?<!\d)2\s*[.:/-]\s*47(?!\d)", normalized))
+
+
+def _podcast_word_limits(language: str) -> tuple[int, int, int]:
+    if language == "Hindi":
+        return 360, 420, 112
+    return 390, 450, 123
+
+
+def _podcast_system_prompt(language: str, reference: str) -> str:
+    minimum, maximum, wpm = _podcast_word_limits(language)
     if language == "Hindi":
         language_instruction = (
             "Write natural, grammatically correct spoken Hindi in Devanagari. "
-            "Use familiar Indian Hindi, not word-for-word English translation. "
-            "Avoid Hinglish and unnecessary highly Sanskritised vocabulary."
+            "Use familiar Indian Hindi, not literal English-to-Hindi translation. "
+            "Avoid Hinglish, awkward Sanskritised expressions, and uncommon "
+            "technical terms when a simple Hindi phrase is available."
         )
-        word_target = "350 to 420 Hindi words"
-        pace = "about 110 to 115 spoken words per minute"
     else:
         language_instruction = (
-            "Write fluent, natural spoken English for a general Indian devotional audience."
+            "Write fluent, natural spoken English for a general Indian devotional audience. "
+            "Use clear, conversational sentences and avoid overly grand or repetitive prose."
         )
-        word_target = "380 to 460 English words"
-        pace = "about 120 to 125 spoken words per minute"
+
+    if _is_gita_2_47(reference):
+        verse_guidance = (
+            "This source is Bhagavad Gita 2.47. Explain its connected teachings "
+            "accurately: a person should perform their duty; should not act only "
+            "from attachment to rewards or fruits; and should not become attached "
+            "to inaction. Explain that non-attachment is not carelessness, lack of "
+            "planning, indifference to quality, or avoidance of responsibility. "
+            "Do not say that a person can never receive the results of work. "
+            "Do not claim that results belong solely to God, fate, or another person. "
+            "Acknowledge that actions influence outcomes while not every factor is controllable."
+        )
+    else:
+        verse_guidance = (
+            "Explain only the teaching supported by this verse's supplied Sanskrit, "
+            "translation, and verified meaning. Do not import the three-part teaching "
+            "of Bhagavad Gita 2.47 unless this source is actually that verse. "
+            "Do not add doctrines, conclusions, or claims from other verses."
+        )
 
     return (
         "You are the careful devotional podcast writer for the Bhajjoray app. "
-        "Create a complete, thoughtful 3-to-4-minute spoken podcast using the "
-        "verified source material in the user message. "
+        "Create a complete spoken podcast from the verified source material in "
+        "the user message. The script must be suitable for approximately 3 to 4 "
+        f"minutes at about {wpm} spoken words per minute. "
+        f"Write between {minimum} and {maximum} whitespace-separated words. "
         f"{language_instruction} "
-        f"Aim for {word_target}, suitable for {pace}. "
-        "CONTENT AND SCRIPTURAL ACCURACY: Explain Bhagavad Gita 2.47 in a balanced "
-        "way when that is the supplied reference. Cover all three connected ideas "
-        "in the supplied verse: a person's responsibility is to perform their "
-        "duty; they should not act only from attachment to the fruits or reward; "
-        "and they should not become attached to inaction. Do not turn non-attachment "
-        "into indifference, carelessness, lack of planning, or refusal to accept "
-        "responsibility. Explain that we can make careful choices and influence "
-        "outcomes, but cannot completely control every factor or guarantee a result. "
-        "Do not say that results belong to God, another person, or fate unless that "
-        "claim is explicitly supported by the supplied meaning. Do not tell listeners "
-        "that they cannot receive the results of their work. "
-        "SOURCE FIDELITY: Treat the supplied translation and meaning as the source "
-        "of truth. Do not add unsupported theological claims, historical claims, "
-        "stories, quotations, or teachings from other verses. If a detail is not "
-        "provided, do not invent it. Never change the verse reference. "
-        "The app provides the verified Sanskrit shloka separately as its own audio. "
-        "Do not reproduce, paraphrase, or transliterate the Sanskrit shloka in this "
-        "podcast script; refer to its chapter and verse instead. "
-        "STRUCTURE: Begin with a warm, brief introduction; explain the meaning; "
-        "give one realistic and relevant everyday example; explain how the listener "
-        "can apply the teaching today; and end with a calm, concise reflection. "
-        "Do not repeat the same point to fill time. "
-        "LANGUAGE PURITY: Use only the requested language. Never insert Chinese, "
-        "Japanese, Korean, or other unrelated scripts or words. "
-        "OUTPUT: Return only the complete spoken narration. Do not add headings, "
-        "Markdown, bullet points, stage directions, sound cues, analysis, chain of "
-        "thought, or comments about the task or the AI. Finish with a complete "
-        "sentence and a natural closing."
+        f"{verse_guidance} "
+        "SOURCE FIDELITY: Treat the supplied Sanskrit, translation, and meaning as "
+        "the source of truth. Do not change the shloka, invent another quotation, "
+        "invent a chapter or verse number, introduce unsupported theological or "
+        "historical claims, or describe an interpretation as the only possible one. "
+        "If the supplied meaning is limited, explain it clearly without pretending "
+        "that missing commentary was supplied. "
+        "REFERENCE SAFETY: The exact chapter and verse reference is returned in API "
+        "metadata. Do not say a chapter number or verse number aloud in the narration. "
+        "You may say 'today's shloka' or 'this verse'. This prevents incorrect spoken "
+        "ordinal numbers. "
+        "AUDIO STRUCTURE: Use five natural sections in connected paragraphs: a brief "
+        "welcome and topic; the source-grounded meaning; the key practical insight; "
+        "one relevant everyday example; and one practical application followed by "
+        "a calm closing reflection. Use only one example. Do not repeat the same "
+        "idea in multiple paragraphs. Keep the introduction and conclusion short. "
+        "Do not mention the app or brand name in the spoken narration; branding is "
+        "handled by the player interface. Do not use time-specific greetings such as "
+        "good morning or good night. "
+        "LANGUAGE PURITY: Use only the requested language. For Hindi, use Devanagari "
+        "and natural Hindi grammar. For English, use English. Do not insert Chinese, "
+        "Japanese, Korean, Arabic, Cyrillic, or unrelated Indian-language scripts. "
+        "Do not use Hinglish in Hindi narration. "
+        "OUTPUT: Return only the final spoken narration as plain text. Do not add "
+        "headings, Markdown, bullets, stage directions, sound cues, analysis, chain "
+        "of thought, or comments about the task or the AI. Do not reproduce the "
+        "Sanskrit shloka because the app supplies it separately as its own audio. "
+        "Finish with a complete sentence and a natural closing. Stay within the "
+        f"{minimum}-{maximum} word range."
     )
-
 
 def _podcast_user_prompt(payload: PodcastSourceRequest, language: str) -> str:
     title = payload.title.strip() if payload.title else "Daily Gita Reflection"
     translation = payload.translation.strip() or "Not supplied"
+    minimum, maximum, _ = _podcast_word_limits(language)
     return (
         f"Requested language: {language}\n"
         f"Podcast title: {title}\n"
-        f"Verified scripture reference: {payload.shloka_reference}\n\n"
-        "Verified original Sanskrit shloka (source reference only; do not repeat it):\n"
+        f"Verified scripture reference (metadata only; do not speak the number): "
+        f"{payload.shloka_reference}\n\n"
+        "Verified original Sanskrit shloka (do not reproduce it in the narration):\n"
         f"{payload.shloka_text}\n\n"
         "Verified translation:\n"
         f"{translation}\n\n"
         "Verified meaning/explanation:\n"
         f"{payload.meaning}\n\n"
-        "Write the complete 3-to-4-minute spoken narration in the requested language. "
-        "Explain the supplied teaching accurately and accessibly. Do not invent "
-        "additional scripture or doctrine."
+        f"Write {minimum} to {maximum} words in {language}. Use exactly one everyday "
+        "example. Explain only what is supported by the supplied source. Do not "
+        "invent verse references, unsupported theology, or extra scriptural claims. "
+        "Return complete, natural spoken narration only."
     )
 
+def _foreign_script_present(text: str) -> bool:
+    # Devanagari and Latin are the expected scripts for Hindi and English here.
+    # These ranges catch common accidental insertions such as the Chinese phrase
+    # that appeared in the first Hindi podcast sample.
+    foreign_script_pattern = (
+        r"[\u0400-\u052f\u0590-\u05ff\u0600-\u06ff"
+        r"\u0750-\u077f\u08a0-\u08ff\u0e00-\u0e7f"
+        r"\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff"
+        r"\uac00-\ud7af\u0a80-\u0aff\u0b00-\u0b7f"
+        r"\u0b80-\u0bff\u0c00-\u0c7f\u0c80-\u0cff"
+        r"\u0d00-\u0d7f]"
+    )
+    return bool(re.search(foreign_script_pattern, text))
 
-def _language_validation_issues(script: str, language: str) -> list[str]:
-    issues = []
-    # Catch Chinese/Japanese/Korean characters such as the unexpected text found
-    # in the earlier Hindi sample. Devanagari is intentionally not included.
-    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", script):
-        issues.append("unrelated_foreign_script")
 
+def _podcast_quality_issues(
+    script: str,
+    language: str,
+    payload: PodcastSourceRequest,
+    finish_reason: str,
+) -> list[str]:
+    issues: list[str] = []
+    minimum, maximum, wpm = _podcast_word_limits(language)
+    word_count = len(script.split())
+    estimated_seconds = round((word_count / wpm) * 60) if word_count else 0
+
+    if word_count < minimum:
+        issues.append(f"too_short_{word_count}_words_minimum_{minimum}")
+    elif word_count > maximum:
+        issues.append(f"too_long_{word_count}_words_maximum_{maximum}")
+
+    if finish_reason == "length":
+        issues.append("generation_token_limit_reached")
+    elif finish_reason not in {"stop", "unknown"}:
+        issues.append(f"unexpected_finish_reason_{finish_reason}")
+
+    if _foreign_script_present(script):
+        issues.append("unexpected_foreign_script")
+
+    letters = [char for char in script if char.isalpha()]
     devanagari_count = len(re.findall(r"[\u0900-\u097f]", script))
     latin_count = len(re.findall(r"[A-Za-z]", script))
-    if language == "Hindi" and devanagari_count < max(80, latin_count):
-        issues.append("not_predominantly_devanagari")
-    if language == "English" and latin_count < max(150, devanagari_count * 2):
-        issues.append("not_predominantly_english")
+    letter_count = len(letters)
+    if language == "Hindi":
+        if letter_count == 0 or devanagari_count / letter_count < 0.65:
+            issues.append("not_predominantly_hindi_devanagari")
+        # Chapter/verse identifiers are supplied in metadata. Catch common
+        # ordinal-number mistakes such as 'दूसरे अध्याय के चौथें श्लोक'.
+        hindi_number_words = (
+            "पहले|दूसरे|तीसरे|चौथे|चौथें|पाँचवें|पांचवें|छठे|सातवें|"
+            "आठवें|नौवें|दसवें|ग्यारहवें|बारहवें|सैंतालीसवें|सैंतालीसवाँ"
+        )
+        if re.search(rf"(?:{hindi_number_words})\s+अध्याय", script) or re.search(
+            rf"अध्याय.{0,45}(?:{hindi_number_words})\s+श्लोक", script
+        ):
+            issues.append("spoken_chapter_verse_number_may_be_inaccurate")
+        if re.search(r"अध्याय\s*[0-9०-९]+|श्लोक\s*[0-9०-९]+", script):
+            issues.append("spoken_numeric_reference_not_allowed")
+    else:
+        if letter_count == 0 or latin_count / letter_count < 0.75:
+            issues.append("not_predominantly_english")
+        if devanagari_count:
+            issues.append("devanagari_text_not_allowed_in_english_narration")
+        if re.search(r"\b(?:chapter|verse)\s*\d+", script, flags=re.IGNORECASE):
+            issues.append("spoken_numeric_reference_not_allowed")
 
-    if not re.search(r"[.!?।॥][\"'”’)]?$", script.strip()):
+    if not re.search(r"[.!?।॥][\"'”’)]?\s*$", script.strip()):
         issues.append("possibly_incomplete_final_sentence")
+
+    # The verified Sanskrit shloka is played separately in the app. Do not allow
+    # the narration to silently alter or duplicate it as generated text.
+    source_shloka = re.sub(r"\s+", "", payload.shloka_text)
+    script_compact = re.sub(r"\s+", "", script)
+    if source_shloka and source_shloka in script_compact:
+        issues.append("source_shloka_repeated_in_podcast")
+
+    if not (180 <= estimated_seconds <= 240):
+        issues.append(f"estimated_duration_outside_target_{estimated_seconds}_seconds")
+
     return issues
 
 
 def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
-    messages = [
-        {"role": "system", "content": _podcast_system_prompt(language)},
+    base_messages = [
+        {
+            "role": "system",
+            "content": _podcast_system_prompt(language, payload.shloka_reference),
+        },
         {"role": "user", "content": _podcast_user_prompt(payload, language)},
     ]
-
-    # A single corrective regeneration handles obvious script contamination or
-    # a missing final sentence. Token-limit truncation is not retried blindly.
+    messages = list(base_messages)
     script = ""
     finish_reason = "unknown"
     issues: list[str] = []
+    attempts = 0
+    minimum, maximum, words_per_minute = _podcast_word_limits(language)
+
     for attempt in range(2):
+        attempts = attempt + 1
         script, finish_reason = _generate(
             messages,
-            max_tokens=1800,
-            temperature=0.65 if attempt == 0 else 0.35,
+            max_tokens=1500 if attempt == 0 else 1250,
+            temperature=0.55 if attempt == 0 else 0.30,
         )
-        if finish_reason == "length":
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"The {language} podcast reached the model token limit and may "
-                    "be incomplete. Do not publish this result; shorten source "
-                    "material or adjust generation settings."
-                ),
-            )
-        issues = _language_validation_issues(script, language)
+        issues = _podcast_quality_issues(script, language, payload, finish_reason)
         if not issues:
             break
+
         if attempt == 0:
-            messages.extend([
+            correction = (
+                "Your previous draft failed these mechanical checks: "
+                + "; ".join(issues)
+                + f". Rewrite the COMPLETE narration, not an explanation of the errors. "
+                f"It must contain {minimum} to {maximum} words and take 3 to 4 minutes. "
+                "Keep exactly one everyday example. Preserve the supplied source meaning. "
+                "Do not mention the numeric chapter/verse reference aloud. Do not repeat "
+                "the Sanskrit shloka. Use only the requested language and finish with a "
+                "complete sentence. Return only the revised narration."
+            )
+            messages = base_messages + [
                 {"role": "assistant", "content": script},
-                {
-                    "role": "user",
-                    "content": (
-                        "Regenerate the entire narration from the original source. "
-                        "Correct these output issues: " + ", ".join(issues) + ". "
-                        "Use only the requested language, do not reproduce the Sanskrit "
-                        "verse, and finish every sentence. Preserve source accuracy."
-                    ),
-                },
-            ])
+                {"role": "user", "content": correction},
+            ]
 
     if issues:
+        word_count = len(script.split())
+        estimated_seconds = round((word_count / words_per_minute) * 60) if word_count else 0
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Podcast output failed language/completion validation; do not publish it.",
+                "message": (
+                    "Podcast generation was rejected after one corrective retry. "
+                    "Do not publish this script."
+                ),
+                "language": language,
+                "attempts": attempts,
+                "word_count": word_count,
+                "estimated_duration_seconds": estimated_seconds,
                 "validation_issues": issues,
             },
         )
 
     word_count = len(script.split())
-    words_per_minute = 112 if language == "Hindi" else 123
     estimated_seconds = round((word_count / words_per_minute) * 60)
     return {
         "language": language,
@@ -339,13 +442,18 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
         "word_count": word_count,
         "estimated_duration_seconds": estimated_seconds,
         "estimated_duration_minutes": round(estimated_seconds / 60, 2),
-        "duration_target_met": 180 <= estimated_seconds <= 240,
+        "duration_target_met": True,
         "finish_reason": finish_reason,
+        "generation_attempts": attempts,
         "quality_checks": {
+            "word_count": "passed",
+            "estimated_duration": "passed",
             "language_validation": "passed",
+            "language_script_check": "passed",
             "unexpected_foreign_script": "not_detected",
             "final_sentence_termination": "passed",
-            "generation_finish_reason": finish_reason,
+            "source_shloka_not_repeated": "passed",
+            "scriptural_accuracy": "requires_editorial_review",
             "source_reference_in_metadata": payload.shloka_reference,
         },
     }
@@ -356,7 +464,7 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
 def health_check():
     return {
         "status": "healthy",
-        "app_version": "2.1.0",
+        "app_version": "2.2.0",
         "model_status": "ready",
         "model_name": MODEL_NAME,
         "model_file": os.path.basename(MODEL_PATH),
