@@ -406,7 +406,7 @@ def _podcast_quality_issues(
             "सैंतालीसवाँ": 47, "सैंतालीसवें": 47, "सैंतालीसवीं": 47,
         }
         source_numbers = re.search(
-            r"(?<!\\d)(\\d{1,2})\\s*[.:/-]\\s*(\\d{1,3})(?!\\d)",
+            r"(?<!\d)(\d{1,2})\s*[.:/-]\s*(\d{1,3})(?!\d)",
             payload.shloka_reference,
         )
         if source_numbers:
@@ -416,10 +416,10 @@ def _podcast_quality_issues(
                 for word in sorted(hindi_ordinal_values, key=len, reverse=True)
             )
             spoken_chapters = re.findall(
-                rf"({ordinal_pattern})\\s+अध्याय", script
+                rf"({ordinal_pattern})\s+अध्याय", script
             )
             spoken_verses = re.findall(
-                rf"({ordinal_pattern})\\s+श्लोक", script
+                rf"({ordinal_pattern})\s+श्लोक", script
             )
             if any(hindi_ordinal_values[word] != expected_chapter for word in spoken_chapters):
                 issues.append("spoken_chapter_reference_does_not_match_source")
