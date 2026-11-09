@@ -223,7 +223,7 @@ def _podcast_word_limits(language: str) -> tuple[int, int, int]:
         # Allow 280 to 460 words (~2m30s to ~4m06s) so valid ~300-word single-pass
         # Qwen generations pass cleanly without false HTTP 502 rejections.
         return 280, 460, 112
-    return 300, 450, 123
+    return 300, 480, 123
 
 
 def _podcast_target_words(language: str) -> tuple[int, int]:
@@ -233,7 +233,7 @@ def _podcast_target_words(language: str) -> tuple[int, int]:
         # reliably generates ~330–390 words (approx. 3 to 3.5 minutes)
         # in a single inference pass.
         return 350, 380
-    return 360, 390
+    return 330, 360
 
 
 def _podcast_system_prompt(language: str, reference: str) -> str:
