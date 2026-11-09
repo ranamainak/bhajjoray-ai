@@ -226,7 +226,10 @@ def _podcast_word_limits(language: str) -> tuple[int, int, int]:
 def _podcast_target_words(language: str) -> tuple[int, int]:
     """Narrow generation target that leaves headroom inside hard acceptance limits."""
     if language == "Hindi":
-        return 380, 400
+        # The deployed Qwen model produced 541–542 words against a 380–400
+        # target. Use a conservative guard-band so its observed overrun can
+        # still land inside the 360–420 hard acceptance range.
+        return 260, 280
     return 360, 380
 
 
@@ -444,12 +447,15 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
         f"{max_seconds // 60} minutes {max_seconds % 60:02d} seconds"
     )
 
-    for attempt in range(2):
+    # Keep each HTTP request to one model inference. Azure Container Apps HTTP
+    # ingress closes a non-streaming request after 240 seconds; a second
+    # synchronous inference caused the deployed endpoint to exceed that limit.
+    for attempt in range(1):
         attempts = attempt + 1
         script, finish_reason = _generate(
             messages,
-            max_tokens=1500 if attempt == 0 else 1250,
-            temperature=0.55 if attempt == 0 else 0.30,
+            max_tokens=760 if language == "Hindi" else 1500,
+            temperature=0.55,
         )
         issues = _podcast_quality_issues(script, language, payload, finish_reason)
         attempt_history.append({
@@ -465,47 +471,6 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
         if not issues:
             break
 
-        if attempt == 0:
-            current_word_count = len(script.split())
-            if current_word_count > maximum:
-                length_direction = (
-                    "Shorten the narration substantially. Remove repetition, long "
-                    "introductions, repeated conclusions, and unnecessary transitions. "
-                    "Do not remove the central teaching, the single everyday example, "
-                    "or the practical application. Do not add new ideas. "
-                )
-            elif current_word_count < minimum:
-                length_direction = (
-                    "Expand the narration with concise, source-grounded explanation "
-                    "and practical detail. Do not pad it with repetition or invent "
-                    "additional scriptural claims. Keep exactly one everyday example. "
-                )
-            else:
-                length_direction = (
-                    "Keep the narration concise and within the target range while "
-                    "correcting the listed validation issues. Do not add repetition. "
-                )
-            correction = (
-                "The previous narration failed validation. Rewrite the COMPLETE "
-                "narration as a finished final script. This is an editing task, not "
-                "a request to explain the failure. "
-                f"Validation issues to fix: {'; '.join(issues)}. "
-                f"Previous word count: {current_word_count}. "
-                f"Your new target is {target_minimum} to {target_maximum} words, "
-                f"aiming near {((target_minimum + target_maximum) // 2)}. "
-                f"{length_direction}"
-                f"The absolute permitted range is {minimum} to {maximum} words. "
-                "Preserve the verified source meaning. Do not mention the numeric "
-                "chapter/verse reference aloud. Do not repeat the Sanskrit shloka. "
-                f"Use only the requested language ({language}), and finish with a "
-                f"complete sentence. The narration MUST be between {minimum} and "
-                f"{maximum} words. Return only the revised narration, with no "
-                "headings or explanation."
-            )
-            messages = base_messages + [
-                {"role": "assistant", "content": script},
-                {"role": "user", "content": correction},
-            ]
 
     if issues:
         word_count = len(script.split())
@@ -514,7 +479,7 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
             status_code=502,
             detail={
                 "message": (
-                    "Podcast generation was rejected after one corrective retry. "
+                    "Podcast generation was rejected after one generation attempt. "
                     "Do not publish this script."
                 ),
                 "language": language,
