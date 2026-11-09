@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from llama_cpp import Llama
-
+from r2_storage import upload_podcast_script
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("bhajjoray-ai")
@@ -102,6 +102,41 @@ class PodcastRequest(PodcastSourceRequest):
 def _today_ist() -> str:
     return dt.datetime.now(APP_TIMEZONE).date().isoformat()
 
+def _save_script_to_r2(result: dict) -> dict:
+    """Save a validated podcast script to Cloudflare R2."""
+
+    try:
+        upload_result = upload_podcast_script(
+            podcast_result=result,
+            publication_date=_today_ist(),
+        )
+
+        logger.info(
+            "podcast_script_uploaded language=%s bucket=%s key=%s",
+            result.get("language"),
+            upload_result.get("bucket"),
+            upload_result.get("object_key"),
+        )
+
+        return upload_result
+
+    except Exception as exc:
+        logger.exception(
+            "R2 upload failed for language=%s",
+            result.get("language"),
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "Script generation and validation succeeded, "
+                    "but Cloudflare R2 upload failed."
+                ),
+                "language": result.get("language"),
+                "error_type": type(exc).__name__,
+            },
+        ) from exc
 
 def _normalise_language(value: str) -> str:
     value = value.strip().lower()
@@ -607,13 +642,32 @@ def ask_ai(payload: QueryRequest):
 @app.post("/generate-podcast")
 def generate_podcast(payload: PodcastRequest):
     language = _normalise_language(payload.language)
-    logger.info("podcast_request_started endpoint=generate-podcast language=%s", language)
-    result = _generate_podcast(payload, language)
+
     logger.info(
-        "podcast_request_completed endpoint=generate-podcast language=%s words=%s attempts=%s",
-        language, result.get("word_count"), result.get("generation_attempts"),
+        "podcast_request_started endpoint=generate-podcast language=%s",
+        language,
     )
-    return {"status": "success", "model": MODEL_NAME, **result}
+
+    # Generate and validate the script using the existing Qwen logic.
+    result = _generate_podcast(payload, language)
+
+    # Upload only after successful generation and validation.
+    r2_upload = _save_script_to_r2(result)
+
+    logger.info(
+        "podcast_request_completed endpoint=generate-podcast "
+        "language=%s words=%s attempts=%s r2_upload=success",
+        language,
+        result.get("word_count"),
+        result.get("generation_attempts"),
+    )
+
+    return {
+        "status": "success",
+        "model": MODEL_NAME,
+        **result,
+        "r2_upload": r2_upload,
+    }
 
 
 @app.post("/generate-daily-podcasts")
