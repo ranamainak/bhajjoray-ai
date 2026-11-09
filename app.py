@@ -4,6 +4,7 @@ import os
 import re
 import resource
 import threading
+import time
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -125,8 +126,14 @@ def _generate(
     messages: list[dict], *, max_tokens: int, temperature: float
 ) -> tuple[str, str]:
     """Return cleaned content and finish_reason; never silently hide token truncation."""
+    request_started = time.perf_counter()
+    lock_wait_seconds = 0.0
+    inference_seconds = 0.0
     try:
+        lock_wait_started = time.perf_counter()
         with MODEL_LOCK:
+            lock_wait_seconds = time.perf_counter() - lock_wait_started
+            inference_started = time.perf_counter()
             result = llm.create_chat_completion(
                 messages=messages,
                 max_tokens=max_tokens,
@@ -137,17 +144,35 @@ def _generate(
                 presence_penalty=0.0,
                 stream=False,
             )
+            inference_seconds = time.perf_counter() - inference_started
         choice = result["choices"][0]
         message = choice.get("message") or {}
         content = _clean_model_text(message.get("content") or "")
         finish_reason = str(choice.get("finish_reason") or "unknown")
         if not content:
             raise RuntimeError("The model returned an empty final answer.")
+        usage = result.get("usage") or {}
+        logger.info(
+            "llm_inference_completed lock_wait_seconds=%.2f inference_seconds=%.2f "
+            "total_seconds=%.2f prompt_tokens=%s completion_tokens=%s finish_reason=%s",
+            lock_wait_seconds,
+            inference_seconds,
+            time.perf_counter() - request_started,
+            usage.get("prompt_tokens", "unknown"),
+            usage.get("completion_tokens", "unknown"),
+            finish_reason,
+        )
         return content, finish_reason
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Model generation failed")
+        logger.exception(
+            "Model generation failed after %.2f seconds (lock wait %.2f seconds, "
+            "inference %.2f seconds)",
+            time.perf_counter() - request_started,
+            lock_wait_seconds,
+            inference_seconds,
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Model generation failed: {type(exc).__name__}",
@@ -192,13 +217,22 @@ def _is_gita_2_47(reference: str) -> bool:
 
 
 def _podcast_word_limits(language: str) -> tuple[int, int, int]:
+    """Hard acceptance limits and estimated speaking rate."""
     if language == "Hindi":
         return 360, 420, 112
     return 340, 400, 123
 
 
+def _podcast_target_words(language: str) -> tuple[int, int]:
+    """Narrow generation target that leaves headroom inside hard acceptance limits."""
+    if language == "Hindi":
+        return 380, 400
+    return 360, 380
+
+
 def _podcast_system_prompt(language: str, reference: str) -> str:
     minimum, maximum, wpm = _podcast_word_limits(language)
+    target_minimum, target_maximum = _podcast_target_words(language)
     min_seconds = round(minimum / wpm * 60)
     max_seconds = round(maximum / wpm * 60)
     duration_guidance = (
@@ -240,9 +274,10 @@ def _podcast_system_prompt(language: str, reference: str) -> str:
     return (
         "You are the careful devotional podcast writer for the Bhajjoray app. "
         "Create a complete spoken podcast from the verified source material in "
-        "the user message. Follow the word-count requirement as the strict priority. "
-        f"Write between {minimum} and {maximum} whitespace-separated words, aiming "
-        f"for approximately {round((minimum + maximum) / 2)} words. "
+        "the user message. "
+        f"Aim for {target_minimum} to {target_maximum} whitespace-separated words. "
+        f"The absolute permitted range is {minimum} to {maximum} words; never exceed "
+        "that hard maximum. Prefer a concise script over filling the entire limit. "
         f"At about {wpm} spoken words per minute, this corresponds to approximately "
         f"{duration_guidance} of narration. Never add words just to lengthen the audio. "
         f"{language_instruction} "
@@ -281,6 +316,7 @@ def _podcast_user_prompt(payload: PodcastSourceRequest, language: str) -> str:
     title = payload.title.strip() if payload.title else "Daily Gita Reflection"
     translation = payload.translation.strip() or "Not supplied"
     minimum, maximum, _ = _podcast_word_limits(language)
+    target_minimum, target_maximum = _podcast_target_words(language)
     return (
         f"Requested language: {language}\n"
         f"Podcast title: {title}\n"
@@ -292,9 +328,8 @@ def _podcast_user_prompt(payload: PodcastSourceRequest, language: str) -> str:
         f"{translation}\n\n"
         "Verified meaning/explanation:\n"
         f"{payload.meaning}\n\n"
-        f"Write {minimum} to {maximum} words in {language}, aiming for "
-        f"approximately {round((minimum + maximum) / 2)} words. This word-count "
-        "requirement is strict and takes priority over any preferred audio length. "
+        f"Aim for {target_minimum} to {target_maximum} words in {language}; the hard "
+        f"acceptance range is {minimum} to {maximum}. "
         "Use exactly one everyday example. Explain only what is supported by the supplied source. Do not "
         "invent verse references, unsupported theology, or extra scriptural claims. "
         "Return complete, natural spoken narration only."
@@ -400,6 +435,8 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
     issues: list[str] = []
     attempts = 0
     minimum, maximum, words_per_minute = _podcast_word_limits(language)
+    target_minimum, target_maximum = _podcast_target_words(language)
+    attempt_history: list[dict] = []
     min_seconds = round(minimum / words_per_minute * 60)
     max_seconds = round(maximum / words_per_minute * 60)
     duration_guidance = (
@@ -415,22 +452,55 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
             temperature=0.55 if attempt == 0 else 0.30,
         )
         issues = _podcast_quality_issues(script, language, payload, finish_reason)
+        attempt_history.append({
+            "attempt": attempts,
+            "word_count": len(script.split()),
+            "finish_reason": finish_reason,
+            "validation_issues": list(issues),
+        })
+        logger.info(
+            "podcast_attempt_finished language=%s attempt=%s words=%s finish_reason=%s issues=%s",
+            language, attempts, len(script.split()), finish_reason, issues,
+        )
         if not issues:
             break
 
         if attempt == 0:
+            current_word_count = len(script.split())
+            if current_word_count > maximum:
+                length_direction = (
+                    "Shorten the narration substantially. Remove repetition, long "
+                    "introductions, repeated conclusions, and unnecessary transitions. "
+                    "Do not remove the central teaching, the single everyday example, "
+                    "or the practical application. Do not add new ideas. "
+                )
+            elif current_word_count < minimum:
+                length_direction = (
+                    "Expand the narration with concise, source-grounded explanation "
+                    "and practical detail. Do not pad it with repetition or invent "
+                    "additional scriptural claims. Keep exactly one everyday example. "
+                )
+            else:
+                length_direction = (
+                    "Keep the narration concise and within the target range while "
+                    "correcting the listed validation issues. Do not add repetition. "
+                )
             correction = (
-                "Your previous draft failed these mechanical checks: "
-                + "; ".join(issues)
-                + f". Rewrite the COMPLETE narration, not an explanation of the errors. "
-                f"It must contain strictly {minimum} to {maximum} words, aiming for "
-                f"approximately {round((minimum + maximum) / 2)} words. At the stated "
-                f"speaking rate this is approximately {duration_guidance}. The word-count "
-                "limit takes priority; do not add words to reach a longer duration. "
-                "Keep exactly one everyday example. Preserve the supplied source meaning. "
-                "Do not mention the numeric chapter/verse reference aloud. Do not repeat "
-                "the Sanskrit shloka. Use only the requested language and finish with a "
-                "complete sentence. Return only the revised narration."
+                "The previous narration failed validation. Rewrite the COMPLETE "
+                "narration as a finished final script. This is an editing task, not "
+                "a request to explain the failure. "
+                f"Validation issues to fix: {'; '.join(issues)}. "
+                f"Previous word count: {current_word_count}. "
+                f"Your new target is {target_minimum} to {target_maximum} words, "
+                f"aiming near {((target_minimum + target_maximum) // 2)}. "
+                f"{length_direction}"
+                f"The absolute permitted range is {minimum} to {maximum} words. "
+                "Preserve the verified source meaning. Do not mention the numeric "
+                "chapter/verse reference aloud. Do not repeat the Sanskrit shloka. "
+                f"Use only the requested language ({language}), and finish with a "
+                f"complete sentence. The narration MUST be between {minimum} and "
+                f"{maximum} words. Return only the revised narration, with no "
+                "headings or explanation."
             )
             messages = base_messages + [
                 {"role": "assistant", "content": script},
@@ -449,6 +519,7 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
                 ),
                 "language": language,
                 "attempts": attempts,
+                "attempt_history": attempt_history,
                 "word_count": word_count,
                 "estimated_duration_seconds": estimated_seconds,
                 "validation_issues": issues,
@@ -468,6 +539,7 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
         "duration_target_met": True,
         "finish_reason": finish_reason,
         "generation_attempts": attempts,
+        "attempt_history": attempt_history,
         "quality_checks": {
             "word_count": "passed",
             "estimated_duration": "passed",
@@ -534,15 +606,22 @@ def ask_ai(payload: QueryRequest):
 @app.post("/generate-podcast")
 def generate_podcast(payload: PodcastRequest):
     language = _normalise_language(payload.language)
+    logger.info("podcast_request_started endpoint=generate-podcast language=%s", language)
     result = _generate_podcast(payload, language)
+    logger.info(
+        "podcast_request_completed endpoint=generate-podcast language=%s words=%s attempts=%s",
+        language, result.get("word_count"), result.get("generation_attempts"),
+    )
     return {"status": "success", "model": MODEL_NAME, **result}
 
 
 @app.post("/generate-daily-podcasts")
 def generate_daily_podcasts(payload: PodcastSourceRequest):
     # Hindi then English, sequentially, using the same model instance.
+    logger.info("podcast_request_started endpoint=generate-daily-podcasts languages=Hindi,English")
     hindi = _generate_podcast(payload, "Hindi")
     english = _generate_podcast(payload, "English")
+    logger.info("podcast_request_completed endpoint=generate-daily-podcasts")
     return {
         "status": "success",
         "model": MODEL_NAME,
