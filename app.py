@@ -224,12 +224,13 @@ def _podcast_word_limits(language: str) -> tuple[int, int, int]:
 
 
 def _podcast_target_words(language: str) -> tuple[int, int]:
-    """Narrow generation target that leaves headroom inside hard acceptance limits."""
+    """Generation targets calibrated against observed Qwen output."""
     if language == "Hindi":
-        # The deployed Qwen model produced 541–542 words against a 380–400
-        # target. Use a conservative guard-band so its observed overrun can
-        # still land inside the 360–420 hard acceptance range.
-        return 260, 280
+        # With a 260–280 target, deployed Qwen returned 324 words.
+        # Raise the target to 300–310; observed output ran about 20% above
+        # the target, which should place the script within the 360–420
+        # hard acceptance range without adding a second inference.
+        return 300, 310
     return 360, 380
 
 
