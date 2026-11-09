@@ -17,36 +17,25 @@ logger = logging.getLogger("bhajjoray-ai")
 
 APP_TIMEZONE = ZoneInfo("Asia/Kolkata")
 MODEL_NAME = "Qwen3.5-4B Q4_K_M"
-MODEL_PATH = os.getenv(
-    "LLAMA_MODEL_PATH", "/app/models/Qwen3.5-4B-Q4_K_M.gguf"
-)
+MODEL_PATH = os.getenv("LLAMA_MODEL_PATH", "/app/models/Qwen3.5-4B-Q4_K_M.gguf")
 MODEL_CONTEXT = int(os.getenv("LLM_N_CTX", "4096"))
 MODEL_THREADS = int(os.getenv("LLM_N_THREADS", "4"))
 MODEL_BATCH = int(os.getenv("LLM_N_BATCH", "128"))
 
-# Keep this list only as the existing app's small festival override table.
-# Move to a maintained festival data source before relying on it year-round.
+# Retain the existing festival overrides. This is not a complete festival calendar.
 FESTIVAL_DB = {
     "2026-11-07": "Pradosh Vrat",
     "2026-11-08": "Diwali / Laxmi Puja",
 }
 
-app = FastAPI(title="Bhajjoray AI", version="2.0.0")
+app = FastAPI(title="Bhajjoray AI", version="2.1.0")
 
-# The model is deliberately shared and all inference is serialised. This keeps
-# two requests from allocating separate generation/KV-cache work concurrently
-# inside the existing 4-vCPU / 8-GB container.
+# One shared model instance and serial inference protect the 4-vCPU / 8-GB container.
 MODEL_LOCK = threading.Lock()
 
 
 def _configure_non_thinking_chat(model: Llama) -> None:
-    """Use the GGUF's own chat template, passing enable_thinking=False.
-
-    llama-cpp-python 0.3.36's high-level create_chat_completion API does not
-    expose chat_template_kwargs as a public argument. Its GGUF-derived Jinja
-    handler accepts extra template variables, so wrap that handler rather than
-    manually recreating Qwen's special-token/chat format.
-    """
+    """Pass enable_thinking=False through the GGUF's registered Jinja template."""
     handler = model._chat_handlers.get(model.chat_format)
     if handler is None:
         raise RuntimeError(
@@ -69,11 +58,7 @@ def _load_model() -> Llama:
 
     logger.info(
         "Loading %s from %s (ctx=%s, threads=%s, batch=%s)",
-        MODEL_NAME,
-        MODEL_PATH,
-        MODEL_CONTEXT,
-        MODEL_THREADS,
-        MODEL_BATCH,
+        MODEL_NAME, MODEL_PATH, MODEL_CONTEXT, MODEL_THREADS, MODEL_BATCH,
     )
     model = Llama(
         model_path=MODEL_PATH,
@@ -92,8 +77,7 @@ def _load_model() -> Llama:
     return model
 
 
-# Preserve the current deployment's startup-loading behaviour: Azure should
-# only mark this container healthy after the model has loaded successfully.
+# Startup only becomes healthy after the model has loaded.
 llm = _load_model()
 
 
@@ -114,7 +98,6 @@ class PodcastRequest(PodcastSourceRequest):
     language: str = Field(min_length=2, max_length=20)
 
 
-
 def _today_ist() -> str:
     return dt.datetime.now(APP_TIMEZONE).date().isoformat()
 
@@ -125,16 +108,11 @@ def _normalise_language(value: str) -> str:
         return "Hindi"
     if value in {"english", "en"}:
         return "English"
-    raise HTTPException(
-        status_code=422,
-        detail="language must be Hindi or English",
-    )
+    raise HTTPException(status_code=422, detail="language must be Hindi or English")
 
 
 def _clean_model_text(text: str) -> str:
     text = (text or "").strip()
-    # Defensive cleanup in case a model/template build still emits reasoning
-    # markers despite non-thinking mode being requested.
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
     if "</think>" in text.lower():
         text = re.split(r"</think>", text, flags=re.IGNORECASE)[-1]
@@ -143,7 +121,10 @@ def _clean_model_text(text: str) -> str:
     return text.strip()
 
 
-def _generate(messages: list[dict], *, max_tokens: int, temperature: float) -> str:
+def _generate(
+    messages: list[dict], *, max_tokens: int, temperature: float
+) -> tuple[str, str]:
+    """Return cleaned content and finish_reason; never silently hide token truncation."""
     try:
         with MODEL_LOCK:
             result = llm.create_chat_completion(
@@ -152,16 +133,17 @@ def _generate(messages: list[dict], *, max_tokens: int, temperature: float) -> s
                 temperature=temperature,
                 top_p=0.8,
                 top_k=20,
-                repeat_penalty=1.05,
-                presence_penalty=0.2,
+                repeat_penalty=1.08,
+                presence_penalty=0.0,
                 stream=False,
             )
-        message = result["choices"][0]["message"]
-        content = message.get("content") or ""
-        clean_text = _clean_model_text(content)
-        if not clean_text:
+        choice = result["choices"][0]
+        message = choice.get("message") or {}
+        content = _clean_model_text(message.get("content") or "")
+        finish_reason = str(choice.get("finish_reason") or "unknown")
+        if not content:
             raise RuntimeError("The model returned an empty final answer.")
-        return clean_text
+        return content, finish_reason
     except HTTPException:
         raise
     except Exception as exc:
@@ -175,7 +157,7 @@ def _generate(messages: list[dict], *, max_tokens: int, temperature: float) -> s
 def _memory_stats() -> dict:
     stats = {}
     try:
-        # ru_maxrss is KiB on Linux.
+        # Linux reports ru_maxrss in KiB. This is the process lifetime peak.
         stats["process_peak_rss_mb"] = round(
             resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1
         )
@@ -196,7 +178,6 @@ def _memory_stats() -> dict:
                 value = handle.read().strip()
             if value != "max":
                 numeric_value = int(value)
-                # Some cgroup v1 hosts report an effectively unlimited value.
                 if numeric_value < (1 << 60):
                     stats[key] = round(numeric_value / (1024 * 1024), 1)
         except (OSError, ValueError):
@@ -207,35 +188,53 @@ def _memory_stats() -> dict:
 def _podcast_system_prompt(language: str) -> str:
     if language == "Hindi":
         language_instruction = (
-            "Write natural, clear spoken Hindi in Devanagari. Avoid Hinglish and "
-            "unnecessary Sanskritised vocabulary."
+            "Write natural, grammatically correct spoken Hindi in Devanagari. "
+            "Use familiar Indian Hindi, not word-for-word English translation. "
+            "Avoid Hinglish and unnecessary highly Sanskritised vocabulary."
         )
-        word_target = "350–420 Hindi words"
-        pace = "about 110–115 words per minute"
+        word_target = "350 to 420 Hindi words"
+        pace = "about 110 to 115 spoken words per minute"
     else:
         language_instruction = (
-            "Write natural, clear spoken English suitable for an Indian devotional audience."
+            "Write fluent, natural spoken English for a general Indian devotional audience."
         )
-        word_target = "380–460 English words"
-        pace = "about 120–125 words per minute"
+        word_target = "380 to 460 English words"
+        pace = "about 120 to 125 spoken words per minute"
 
     return (
-        "You are the devotional podcast writer for the Bhajjoray app. "
-        "Create a thoughtful, accurate 3–4 minute spoken podcast based only on "
-        "the verified source material supplied by the user. "
+        "You are the careful devotional podcast writer for the Bhajjoray app. "
+        "Create a complete, thoughtful 3-to-4-minute spoken podcast using the "
+        "verified source material in the user message. "
         f"{language_instruction} "
         f"Aim for {word_target}, suitable for {pace}. "
-        "Explain the central teaching in accessible language, connect it to "
-        "ordinary daily life using one relevant example, and end with a calm "
-        "practical reflection. "
-        "Do not invent scripture, chapter/verse references, quotations, or "
-        "historical claims. Do not change or recreate the Sanskrit shloka. "
-        "Clearly distinguish the supplied translation/meaning from your "
-        "practical reflection. Do not claim that your interpretation is the "
-        "only interpretation. "
-        "Return only the spoken narration. Do not include analysis, chain of "
-        "thought, bullet points, Markdown, production directions, sound cues, "
-        "or comments about the task or the AI."
+        "CONTENT AND SCRIPTURAL ACCURACY: Explain Bhagavad Gita 2.47 in a balanced "
+        "way when that is the supplied reference. Cover all three connected ideas "
+        "in the supplied verse: a person's responsibility is to perform their "
+        "duty; they should not act only from attachment to the fruits or reward; "
+        "and they should not become attached to inaction. Do not turn non-attachment "
+        "into indifference, carelessness, lack of planning, or refusal to accept "
+        "responsibility. Explain that we can make careful choices and influence "
+        "outcomes, but cannot completely control every factor or guarantee a result. "
+        "Do not say that results belong to God, another person, or fate unless that "
+        "claim is explicitly supported by the supplied meaning. Do not tell listeners "
+        "that they cannot receive the results of their work. "
+        "SOURCE FIDELITY: Treat the supplied translation and meaning as the source "
+        "of truth. Do not add unsupported theological claims, historical claims, "
+        "stories, quotations, or teachings from other verses. If a detail is not "
+        "provided, do not invent it. Never change the verse reference. "
+        "The app provides the verified Sanskrit shloka separately as its own audio. "
+        "Do not reproduce, paraphrase, or transliterate the Sanskrit shloka in this "
+        "podcast script; refer to its chapter and verse instead. "
+        "STRUCTURE: Begin with a warm, brief introduction; explain the meaning; "
+        "give one realistic and relevant everyday example; explain how the listener "
+        "can apply the teaching today; and end with a calm, concise reflection. "
+        "Do not repeat the same point to fill time. "
+        "LANGUAGE PURITY: Use only the requested language. Never insert Chinese, "
+        "Japanese, Korean, or other unrelated scripts or words. "
+        "OUTPUT: Return only the complete spoken narration. Do not add headings, "
+        "Markdown, bullet points, stage directions, sound cues, analysis, chain of "
+        "thought, or comments about the task or the AI. Finish with a complete "
+        "sentence and a natural closing."
     )
 
 
@@ -243,28 +242,92 @@ def _podcast_user_prompt(payload: PodcastSourceRequest, language: str) -> str:
     title = payload.title.strip() if payload.title else "Daily Gita Reflection"
     translation = payload.translation.strip() or "Not supplied"
     return (
-        f"Language: {language}\n"
+        f"Requested language: {language}\n"
         f"Podcast title: {title}\n"
-        f"Verified shloka reference: {payload.shloka_reference}\n\n"
-        "Original Sanskrit shloka (quote only if needed; preserve exactly):\n"
+        f"Verified scripture reference: {payload.shloka_reference}\n\n"
+        "Verified original Sanskrit shloka (source reference only; do not repeat it):\n"
         f"{payload.shloka_text}\n\n"
         "Verified translation:\n"
         f"{translation}\n\n"
         "Verified meaning/explanation:\n"
         f"{payload.meaning}\n\n"
-        "Write the complete 3–4 minute devotional podcast narration now."
+        "Write the complete 3-to-4-minute spoken narration in the requested language. "
+        "Explain the supplied teaching accurately and accessibly. Do not invent "
+        "additional scripture or doctrine."
     )
+
+
+def _language_validation_issues(script: str, language: str) -> list[str]:
+    issues = []
+    # Catch Chinese/Japanese/Korean characters such as the unexpected text found
+    # in the earlier Hindi sample. Devanagari is intentionally not included.
+    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]", script):
+        issues.append("unrelated_foreign_script")
+
+    devanagari_count = len(re.findall(r"[\u0900-\u097f]", script))
+    latin_count = len(re.findall(r"[A-Za-z]", script))
+    if language == "Hindi" and devanagari_count < max(80, latin_count):
+        issues.append("not_predominantly_devanagari")
+    if language == "English" and latin_count < max(150, devanagari_count * 2):
+        issues.append("not_predominantly_english")
+
+    if not re.search(r"[.!?।॥][\"'”’)]?$", script.strip()):
+        issues.append("possibly_incomplete_final_sentence")
+    return issues
 
 
 def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
-    script = _generate(
-        [
-            {"role": "system", "content": _podcast_system_prompt(language)},
-            {"role": "user", "content": _podcast_user_prompt(payload, language)},
-        ],
-        max_tokens=1300,
-        temperature=0.7,
-    )
+    messages = [
+        {"role": "system", "content": _podcast_system_prompt(language)},
+        {"role": "user", "content": _podcast_user_prompt(payload, language)},
+    ]
+
+    # A single corrective regeneration handles obvious script contamination or
+    # a missing final sentence. Token-limit truncation is not retried blindly.
+    script = ""
+    finish_reason = "unknown"
+    issues: list[str] = []
+    for attempt in range(2):
+        script, finish_reason = _generate(
+            messages,
+            max_tokens=1800,
+            temperature=0.65 if attempt == 0 else 0.35,
+        )
+        if finish_reason == "length":
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"The {language} podcast reached the model token limit and may "
+                    "be incomplete. Do not publish this result; shorten source "
+                    "material or adjust generation settings."
+                ),
+            )
+        issues = _language_validation_issues(script, language)
+        if not issues:
+            break
+        if attempt == 0:
+            messages.extend([
+                {"role": "assistant", "content": script},
+                {
+                    "role": "user",
+                    "content": (
+                        "Regenerate the entire narration from the original source. "
+                        "Correct these output issues: " + ", ".join(issues) + ". "
+                        "Use only the requested language, do not reproduce the Sanskrit "
+                        "verse, and finish every sentence. Preserve source accuracy."
+                    ),
+                },
+            ])
+
+    if issues:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "Podcast output failed language/completion validation; do not publish it.",
+                "validation_issues": issues,
+            },
+        )
+
     word_count = len(script.split())
     words_per_minute = 112 if language == "Hindi" else 123
     estimated_seconds = round((word_count / words_per_minute) * 60)
@@ -277,6 +340,14 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
         "estimated_duration_seconds": estimated_seconds,
         "estimated_duration_minutes": round(estimated_seconds / 60, 2),
         "duration_target_met": 180 <= estimated_seconds <= 240,
+        "finish_reason": finish_reason,
+        "quality_checks": {
+            "language_validation": "passed",
+            "unexpected_foreign_script": "not_detected",
+            "final_sentence_termination": "passed",
+            "generation_finish_reason": finish_reason,
+            "source_reference_in_metadata": payload.shloka_reference,
+        },
     }
 
 
@@ -285,6 +356,7 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
 def health_check():
     return {
         "status": "healthy",
+        "app_version": "2.1.0",
         "model_status": "ready",
         "model_name": MODEL_NAME,
         "model_file": os.path.basename(MODEL_PATH),
@@ -303,20 +375,24 @@ def ask_ai(payload: QueryRequest):
 
     system_prompt = (
         "You are a helpful and respectful spiritual guide for the Bhajjoray app. "
-        f"Today is {today_str} ({current_festival}). "
-        f"Respond in {language}. Answer the user's actual question directly. "
-        "Use clear language and avoid describing your reasoning or the task. "
-        "Keep the answer concise unless detail is requested. Do not invent "
-        "scriptural quotations or references."
+        f"Today is {today_str} ({current_festival}). Respond in {language}. "
+        "Answer the user's actual question directly. Use clear, natural language. "
+        "Do not invent scriptural quotations or references, and do not describe "
+        "your reasoning or the task. Finish the answer with a complete sentence."
     )
-    clean_text = _generate(
+    clean_text, finish_reason = _generate(
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": payload.user_text.strip()},
         ],
-        max_tokens=280,
-        temperature=0.45,
+        max_tokens=512,
+        temperature=0.4,
     )
+    if finish_reason == "length":
+        raise HTTPException(
+            status_code=502,
+            detail="The answer reached the generation limit and may be incomplete. Please shorten the question and retry.",
+        )
     return {
         "status": "success",
         "festival_today": current_festival,
@@ -333,8 +409,7 @@ def generate_podcast(payload: PodcastRequest):
 
 @app.post("/generate-daily-podcasts")
 def generate_daily_podcasts(payload: PodcastSourceRequest):
-    # The same model instance generates Hindi first and English second. The
-    # lock in _generate() also serialises this against /ask-ai requests.
+    # Hindi then English, sequentially, using the same model instance.
     hindi = _generate_podcast(payload, "Hindi")
     english = _generate_podcast(payload, "English")
     return {
