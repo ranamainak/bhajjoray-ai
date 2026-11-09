@@ -126,8 +126,14 @@ def _generate(
     messages: list[dict], *, max_tokens: int, temperature: float
 ) -> tuple[str, str]:
     """Return cleaned content and finish_reason; never silently hide token truncation."""
+    request_started = time.perf_counter()
+    lock_wait_seconds = 0.0
+    inference_seconds = 0.0
     try:
+        lock_wait_started = time.perf_counter()
         with MODEL_LOCK:
+            lock_wait_seconds = time.perf_counter() - lock_wait_started
+            inference_started = time.perf_counter()
             result = llm.create_chat_completion(
                 messages=messages,
                 max_tokens=max_tokens,
@@ -138,17 +144,35 @@ def _generate(
                 presence_penalty=0.0,
                 stream=False,
             )
+            inference_seconds = time.perf_counter() - inference_started
         choice = result["choices"][0]
         message = choice.get("message") or {}
         content = _clean_model_text(message.get("content") or "")
         finish_reason = str(choice.get("finish_reason") or "unknown")
         if not content:
             raise RuntimeError("The model returned an empty final answer.")
+        usage = result.get("usage") or {}
+        logger.info(
+            "llm_inference_completed lock_wait_seconds=%.2f inference_seconds=%.2f "
+            "total_seconds=%.2f prompt_tokens=%s completion_tokens=%s finish_reason=%s",
+            lock_wait_seconds,
+            inference_seconds,
+            time.perf_counter() - request_started,
+            usage.get("prompt_tokens", "unknown"),
+            usage.get("completion_tokens", "unknown"),
+            finish_reason,
+        )
         return content, finish_reason
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Model generation failed")
+        logger.exception(
+            "Model generation failed after %.2f seconds (lock wait %.2f seconds, "
+            "inference %.2f seconds)",
+            time.perf_counter() - request_started,
+            lock_wait_seconds,
+            inference_seconds,
+        )
         raise HTTPException(
             status_code=500,
             detail=f"Model generation failed: {type(exc).__name__}",
