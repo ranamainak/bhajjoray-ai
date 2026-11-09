@@ -1,13 +1,18 @@
 import datetime as dt
+import json
 import logging
 import os
 import re
 import resource
 import threading
 import time
+import uuid
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.storage.blob import BlobServiceClient
+from azure.storage.queue import QueueClient
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from llama_cpp import Llama
@@ -33,6 +38,17 @@ app = FastAPI(title="Bhajjoray AI", version="2.2.0")
 
 # One shared model instance and serial inference protect the 4-vCPU / 8-GB container.
 MODEL_LOCK = threading.Lock()
+
+# Long-running podcast generation is dispatched through durable Azure Storage.
+# The HTTP request only creates a job; the worker processes it independently.
+JOB_QUEUE_NAME = os.getenv("PODCAST_JOB_QUEUE_NAME", "podcast-jobs")
+JOB_CONTAINER_NAME = os.getenv("PODCAST_JOB_CONTAINER_NAME", "podcast-jobs")
+JOB_VISIBILITY_SECONDS = int(os.getenv("PODCAST_JOB_VISIBILITY_SECONDS", "900"))
+JOB_BLOB_CONTAINER = None
+JOB_QUEUE = None
+JOB_BACKEND_ERROR = None
+JOB_WORKER_THREAD = None
+JOB_WORKER_STOP = threading.Event()
 
 
 def _configure_non_thinking_chat(model: Llama) -> None:
@@ -208,6 +224,274 @@ def _memory_stats() -> dict:
         except (OSError, ValueError):
             continue
     return stats
+
+
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _initialise_job_backend() -> None:
+    """Initialise durable job storage when an Azure Storage connection is configured."""
+    global JOB_BLOB_CONTAINER, JOB_QUEUE, JOB_BACKEND_ERROR
+
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not connection_string:
+        JOB_BACKEND_ERROR = "AZURE_STORAGE_CONNECTION_STRING is not configured"
+        logger.warning("Podcast job queue disabled: %s", JOB_BACKEND_ERROR)
+        return
+
+    try:
+        blob_service = BlobServiceClient.from_connection_string(connection_string)
+        container = blob_service.get_container_client(JOB_CONTAINER_NAME)
+        try:
+            container.create_container()
+        except ResourceExistsError:
+            pass
+
+        queue = QueueClient.from_connection_string(
+            connection_string,
+            queue_name=JOB_QUEUE_NAME,
+        )
+        try:
+            queue.create_queue()
+        except ResourceExistsError:
+            pass
+
+        JOB_BLOB_CONTAINER = container
+        JOB_QUEUE = queue
+        JOB_BACKEND_ERROR = None
+        logger.info(
+            "Podcast durable job backend ready (queue=%s, blob_container=%s)",
+            JOB_QUEUE_NAME,
+            JOB_CONTAINER_NAME,
+        )
+    except Exception as exc:
+        JOB_BLOB_CONTAINER = None
+        JOB_QUEUE = None
+        JOB_BACKEND_ERROR = f"{type(exc).__name__}: {exc}"
+        logger.exception("Could not initialise podcast job storage")
+
+
+def _save_job(job: dict) -> None:
+    if JOB_BLOB_CONTAINER is None:
+        raise RuntimeError("Podcast job blob storage is not available")
+    blob = JOB_BLOB_CONTAINER.get_blob_client(f"{job['job_id']}.json")
+    body = json.dumps(job, ensure_ascii=False, separators=(",", ":"))
+    blob.upload_blob(body, overwrite=True, content_type="application/json")
+
+
+def _load_job(job_id: str) -> dict:
+    if JOB_BLOB_CONTAINER is None:
+        raise HTTPException(status_code=503, detail="Podcast job storage is not available")
+    try:
+        blob = JOB_BLOB_CONTAINER.get_blob_client(f"{job_id}.json")
+        raw = blob.download_blob().readall()
+        return json.loads(raw.decode("utf-8"))
+    except ResourceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Podcast job was not found") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Could not read podcast job %s", job_id)
+        raise HTTPException(status_code=503, detail="Could not read podcast job status") from exc
+
+
+def _public_job(job: dict) -> dict:
+    """Do not return stored request payloads or internal storage details to clients."""
+    result = {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "language": job.get("language"),
+        "job_type": job.get("job_type"),
+    }
+    if job.get("status") == "completed":
+        result["result"] = job.get("result")
+    if job.get("status") == "failed":
+        result["error"] = job.get("error")
+    return result
+
+
+def _renew_queue_message_lease(message_id: str, initial_receipt: str, stop_event: threading.Event, receipt_holder: dict) -> None:
+    """Keep a long-running generation message invisible while its worker is active."""
+    while not stop_event.wait(60):
+        try:
+            updated = JOB_QUEUE.update_message(
+                message_id,
+                pop_receipt=receipt_holder["value"],
+                visibility_timeout=JOB_VISIBILITY_SECONDS,
+            )
+            receipt_holder["value"] = updated.pop_receipt
+        except Exception:
+            logger.exception("Could not renew podcast job queue lease for message %s", message_id)
+
+
+def _process_podcast_job(job: dict) -> dict:
+    request_data = job.get("request") or {}
+    if job.get("job_type") == "daily":
+        payload = PodcastSourceRequest(**request_data)
+        hindi = _generate_podcast(payload, "Hindi")
+        english = _generate_podcast(payload, "English")
+        return {
+            "status": "success",
+            "model": MODEL_NAME,
+            "shloka_reference": payload.shloka_reference,
+            "scripts": {"Hindi": hindi, "English": english},
+        }
+
+    payload = PodcastRequest(**request_data)
+    language = _normalise_language(payload.language)
+    result = _generate_podcast(payload, language)
+    return {"status": "success", "model": MODEL_NAME, **result}
+
+
+def _podcast_job_worker() -> None:
+    logger.info("Podcast job worker started")
+    while not JOB_WORKER_STOP.is_set():
+        try:
+            message = JOB_QUEUE.receive_message(
+                visibility_timeout=JOB_VISIBILITY_SECONDS,
+                timeout=5,
+            )
+            if message is None:
+                continue
+
+            job_id = str(message.content).strip()
+            lease_stop = threading.Event()
+            receipt_holder = {"value": message.pop_receipt}
+            heartbeat = threading.Thread(
+                target=_renew_queue_message_lease,
+                args=(message.id, message.pop_receipt, lease_stop, receipt_holder),
+                name=f"podcast-lease-{job_id[:8]}",
+                daemon=True,
+            )
+            heartbeat.start()
+            delete_message = False
+
+            try:
+                job = _load_job(job_id)
+                if job.get("status") == "completed":
+                    delete_message = True
+                    continue
+
+                job["status"] = "processing"
+                job["updated_at"] = _utc_now()
+                job["started_at"] = job.get("started_at") or job["updated_at"]
+                _save_job(job)
+                logger.info("podcast_job_started job_id=%s job_type=%s", job_id, job.get("job_type"))
+
+                try:
+                    result = _process_podcast_job(job)
+                    job["status"] = "completed"
+                    job["result"] = result
+                    job.pop("error", None)
+                except HTTPException as exc:
+                    job["status"] = "failed"
+                    job["error"] = exc.detail
+                except Exception as exc:
+                    logger.exception("Podcast job failed job_id=%s", job_id)
+                    job["status"] = "failed"
+                    job["error"] = f"{type(exc).__name__}: {exc}"
+
+                job["updated_at"] = _utc_now()
+                job["completed_at"] = job["updated_at"]
+                _save_job(job)
+                logger.info("podcast_job_finished job_id=%s status=%s", job_id, job["status"])
+                delete_message = True
+            except HTTPException as exc:
+                if exc.status_code == 404:
+                    logger.warning("Discarding queue message for missing job_id=%s", job_id)
+                    delete_message = True
+                else:
+                    logger.exception("Unable to process podcast job record %s", job_id)
+            except Exception:
+                logger.exception("Podcast job worker error job_id=%s", job_id)
+            finally:
+                lease_stop.set()
+                heartbeat.join(timeout=3)
+                if delete_message:
+                    try:
+                        JOB_QUEUE.delete_message(message.id, receipt_holder["value"])
+                    except Exception:
+                        logger.exception("Could not delete completed queue message job_id=%s", job_id)
+        except Exception:
+            logger.exception("Podcast queue poll failed")
+            JOB_WORKER_STOP.wait(5)
+    logger.info("Podcast job worker stopped")
+
+
+def _enqueue_podcast_job(job_type: str, request_data: dict, language: Optional[str] = None) -> dict:
+    if JOB_QUEUE is None or JOB_BLOB_CONTAINER is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "Asynchronous podcast processing is not configured.",
+                "required_setting": "AZURE_STORAGE_CONNECTION_STRING",
+                "backend_error": JOB_BACKEND_ERROR,
+            },
+        )
+
+    job_id = str(uuid.uuid4())
+    now = _utc_now()
+    job = {
+        "job_id": job_id,
+        "job_type": job_type,
+        "language": language,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "request": request_data,
+    }
+
+    try:
+        # Save first, then enqueue. A queue message never points to a missing job record.
+        _save_job(job)
+        JOB_QUEUE.send_message(job_id)
+    except Exception as exc:
+        logger.exception("Could not enqueue podcast job %s", job_id)
+        job["status"] = "failed"
+        job["error"] = "Could not submit job to Azure Storage Queue"
+        job["updated_at"] = _utc_now()
+        try:
+            _save_job(job)
+        except Exception:
+            logger.exception("Could not save failed enqueue state for job %s", job_id)
+        raise HTTPException(status_code=503, detail=job["error"]) from exc
+
+    logger.info("podcast_job_queued job_id=%s job_type=%s language=%s", job_id, job_type, language)
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "job_type": job_type,
+        "language": language,
+        "status_url": f"/jobs/{job_id}",
+        "message": "Podcast generation has been queued. Poll status_url until status is completed or failed.",
+    }
+
+
+@app.on_event("startup")
+def start_podcast_job_worker() -> None:
+    global JOB_WORKER_THREAD
+    _initialise_job_backend()
+    if JOB_QUEUE is None:
+        return
+    JOB_WORKER_STOP.clear()
+    JOB_WORKER_THREAD = threading.Thread(
+        target=_podcast_job_worker,
+        name="podcast-job-worker",
+        daemon=True,
+    )
+    JOB_WORKER_THREAD.start()
+
+
+@app.on_event("shutdown")
+def stop_podcast_job_worker() -> None:
+    JOB_WORKER_STOP.set()
+    if JOB_WORKER_THREAD is not None and JOB_WORKER_THREAD.is_alive():
+        JOB_WORKER_THREAD.join(timeout=5)
 
 
 def _is_gita_2_47(reference: str) -> bool:
@@ -567,6 +851,12 @@ def health_check():
         "context_size": MODEL_CONTEXT,
         "threads": MODEL_THREADS,
         "memory": _memory_stats(),
+        "podcast_jobs": {
+            "enabled": JOB_QUEUE is not None and JOB_BLOB_CONTAINER is not None,
+            "queue": JOB_QUEUE_NAME,
+            "worker_running": JOB_WORKER_THREAD is not None and JOB_WORKER_THREAD.is_alive(),
+            "configuration_error": JOB_BACKEND_ERROR,
+        },
     }
 
 
@@ -603,25 +893,48 @@ def ask_ai(payload: QueryRequest):
     }
 
 
-@app.post("/generate-podcast")
+@app.post("/generate-podcast", status_code=202)
 def generate_podcast(payload: PodcastRequest):
+    """Queue a single-language podcast and return immediately with a job ID."""
     language = _normalise_language(payload.language)
-    logger.info("podcast_request_started endpoint=generate-podcast language=%s", language)
+    return _enqueue_podcast_job("single", payload.dict(), language)
+
+
+@app.post("/generate-daily-podcasts", status_code=202)
+def generate_daily_podcasts(payload: PodcastSourceRequest):
+    """Queue Hindi and English generation; each language is processed sequentially."""
+    return _enqueue_podcast_job("daily", payload.dict())
+
+
+@app.get("/jobs/{job_id}")
+def get_podcast_job(job_id: str):
+    """Poll a durable job until it is completed or failed."""
+    try:
+        uuid.UUID(job_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=400, detail="job_id must be a valid UUID") from exc
+    return _public_job(_load_job(job_id))
+
+
+# Explicitly retained for short diagnostics only. Long podcasts can exceed ACA's
+# 240-second HTTP ingress request timeout; application clients should use /generate-podcast.
+@app.post("/generate-podcast-sync")
+def generate_podcast_sync(payload: PodcastRequest):
+    language = _normalise_language(payload.language)
+    logger.info("podcast_request_started endpoint=generate-podcast-sync language=%s", language)
     result = _generate_podcast(payload, language)
     logger.info(
-        "podcast_request_completed endpoint=generate-podcast language=%s words=%s attempts=%s",
+        "podcast_request_completed endpoint=generate-podcast-sync language=%s words=%s attempts=%s",
         language, result.get("word_count"), result.get("generation_attempts"),
     )
     return {"status": "success", "model": MODEL_NAME, **result}
 
 
-@app.post("/generate-daily-podcasts")
-def generate_daily_podcasts(payload: PodcastSourceRequest):
-    # Hindi then English, sequentially, using the same model instance.
-    logger.info("podcast_request_started endpoint=generate-daily-podcasts languages=Hindi,English")
+@app.post("/generate-daily-podcasts-sync")
+def generate_daily_podcasts_sync(payload: PodcastSourceRequest):
+    logger.info("podcast_request_started endpoint=generate-daily-podcasts-sync")
     hindi = _generate_podcast(payload, "Hindi")
     english = _generate_podcast(payload, "English")
-    logger.info("podcast_request_completed endpoint=generate-daily-podcasts")
     return {
         "status": "success",
         "model": MODEL_NAME,
