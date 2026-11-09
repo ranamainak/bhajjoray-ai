@@ -4,6 +4,9 @@ import os
 import re
 import resource
 import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -32,6 +35,16 @@ app = FastAPI(title="Bhajjoray AI", version="2.2.0")
 
 # One shared model instance and serial inference protect the 4-vCPU / 8-GB container.
 MODEL_LOCK = threading.Lock()
+
+# Long podcast generations run outside the HTTP request lifecycle. The single worker
+# preserves serial model inference; the bounded active-job count prevents an
+# unbounded in-memory queue on this single-replica service.
+PODCAST_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="podcast-job")
+PODCAST_JOBS: dict[str, dict] = {}
+PODCAST_JOBS_LOCK = threading.Lock()
+MAX_ACTIVE_PODCAST_JOBS = 2
+MAX_STORED_PODCAST_JOBS = 50
+PODCAST_JOB_TTL_SECONDS = 6 * 60 * 60
 
 
 def _configure_non_thinking_chat(model: Llama) -> None:
@@ -126,7 +139,15 @@ def _generate(
 ) -> tuple[str, str]:
     """Return cleaned content and finish_reason; never silently hide token truncation."""
     try:
+        lock_requested_at = time.monotonic()
+        logger.info("Model inference waiting for model lock")
         with MODEL_LOCK:
+            lock_wait_seconds = time.monotonic() - lock_requested_at
+            inference_started_at = time.monotonic()
+            logger.info(
+                "Model inference started (lock_wait_seconds=%.1f)",
+                lock_wait_seconds,
+            )
             result = llm.create_chat_completion(
                 messages=messages,
                 max_tokens=max_tokens,
@@ -137,6 +158,12 @@ def _generate(
                 presence_penalty=0.0,
                 stream=False,
             )
+            inference_seconds = time.monotonic() - inference_started_at
+        logger.info(
+            "Model inference finished (lock_wait_seconds=%.1f, inference_seconds=%.1f)",
+            lock_wait_seconds,
+            inference_seconds,
+        )
         choice = result["choices"][0]
         message = choice.get("message") or {}
         content = _clean_model_text(message.get("content") or "")
@@ -409,12 +436,27 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
 
     for attempt in range(2):
         attempts = attempt + 1
+        attempt_started_at = time.monotonic()
+        logger.info(
+            "Podcast generation attempt %s/2 started (language=%s)",
+            attempts,
+            language,
+        )
         script, finish_reason = _generate(
             messages,
             max_tokens=1500 if attempt == 0 else 1250,
             temperature=0.55 if attempt == 0 else 0.30,
         )
         issues = _podcast_quality_issues(script, language, payload, finish_reason)
+        logger.info(
+            "Podcast generation attempt %s/2 finished "
+            "(language=%s, seconds=%.1f, words=%s, issues=%s)",
+            attempts,
+            language,
+            time.monotonic() - attempt_started_at,
+            len(script.split()),
+            issues or "none",
+        )
         if not issues:
             break
 
@@ -482,6 +524,160 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
     }
 
 
+
+def _prune_podcast_jobs_locked() -> None:
+    """Remove expired terminal jobs and cap retained job history."""
+    now = time.time()
+    for job_id, job in list(PODCAST_JOBS.items()):
+        if (
+            job["status"] in {"completed", "failed"}
+            and now - job["created_at_epoch"] > PODCAST_JOB_TTL_SECONDS
+        ):
+            PODCAST_JOBS.pop(job_id, None)
+
+    if len(PODCAST_JOBS) > MAX_STORED_PODCAST_JOBS:
+        terminal_jobs = sorted(
+            (
+                (job["created_at_epoch"], job_id)
+                for job_id, job in PODCAST_JOBS.items()
+                if job["status"] in {"completed", "failed"}
+            )
+        )
+        while len(PODCAST_JOBS) > MAX_STORED_PODCAST_JOBS and terminal_jobs:
+            _, oldest_job_id = terminal_jobs.pop(0)
+            PODCAST_JOBS.pop(oldest_job_id, None)
+
+
+def _run_podcast_job(
+    job_id: str, payload: PodcastSourceRequest, language: str
+) -> None:
+    """Run one podcast job and retain its result for the polling endpoint."""
+    started_at = time.monotonic()
+    with PODCAST_JOBS_LOCK:
+        job = PODCAST_JOBS.get(job_id)
+        if job is None:
+            return
+        job["status"] = "running"
+        job["started_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    logger.info("Podcast job %s started (language=%s)", job_id, language)
+    try:
+        result = _generate_podcast(payload, language)
+    except HTTPException as exc:
+        logger.warning(
+            "Podcast job %s rejected (language=%s, status=%s, detail=%s)",
+            job_id,
+            language,
+            exc.status_code,
+            exc.detail,
+        )
+        with PODCAST_JOBS_LOCK:
+            job = PODCAST_JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "failed"
+                job["error"] = exc.detail
+                job["error_status_code"] = exc.status_code
+    except Exception as exc:
+        logger.exception("Podcast job %s failed unexpectedly", job_id)
+        with PODCAST_JOBS_LOCK:
+            job = PODCAST_JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "failed"
+                job["error"] = {
+                    "message": "Internal podcast generation error",
+                    "error_type": type(exc).__name__,
+                }
+                job["error_status_code"] = 500
+    else:
+        with PODCAST_JOBS_LOCK:
+            job = PODCAST_JOBS.get(job_id)
+            if job is not None:
+                job["status"] = "completed"
+                job["result"] = result
+    finally:
+        elapsed_seconds = round(time.monotonic() - started_at, 1)
+        with PODCAST_JOBS_LOCK:
+            job = PODCAST_JOBS.get(job_id)
+            if job is not None:
+                job["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                job["elapsed_seconds"] = elapsed_seconds
+        logger.info(
+            "Podcast job %s finished (language=%s, elapsed_seconds=%.1f)",
+            job_id,
+            language,
+            elapsed_seconds,
+        )
+
+
+def _queue_podcast_job(
+    payload: PodcastSourceRequest, language: str
+) -> dict:
+    """Queue a podcast and return immediately, avoiding the ingress request timeout."""
+    job_id = uuid.uuid4().hex
+    now = time.time()
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "language": language,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "created_at_epoch": now,
+        "started_at": None,
+        "completed_at": None,
+        "elapsed_seconds": None,
+        "result": None,
+        "error": None,
+        "error_status_code": None,
+    }
+
+    with PODCAST_JOBS_LOCK:
+        _prune_podcast_jobs_locked()
+        active_jobs = sum(
+            1 for existing in PODCAST_JOBS.values()
+            if existing["status"] in {"queued", "running"}
+        )
+        if active_jobs >= MAX_ACTIVE_PODCAST_JOBS:
+            raise HTTPException(
+                status_code=429,
+                detail="Podcast generation queue is full. Please try again shortly.",
+            )
+
+        PODCAST_JOBS[job_id] = job
+        try:
+            PODCAST_EXECUTOR.submit(_run_podcast_job, job_id, payload, language)
+        except RuntimeError as exc:
+            PODCAST_JOBS.pop(job_id, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Podcast generation worker is unavailable. Please retry.",
+            ) from exc
+
+    logger.info("Podcast job %s accepted (language=%s)", job_id, language)
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/podcast-jobs/{job_id}",
+        "poll_interval_seconds": 5,
+    }
+
+
+def _podcast_job_response(job: dict) -> dict:
+    response = {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "language": job["language"],
+        "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "completed_at": job["completed_at"],
+        "elapsed_seconds": job["elapsed_seconds"],
+    }
+    if job["status"] == "completed":
+        response["result"] = job["result"]
+    elif job["status"] == "failed":
+        response["error"] = job["error"]
+        response["error_status_code"] = job["error_status_code"]
+    return response
+
+
 @app.get("/")
 @app.get("/health")
 def health_check():
@@ -531,9 +727,30 @@ def ask_ai(payload: QueryRequest):
     }
 
 
+@app.post("/generate-podcast-async", status_code=202)
+def generate_podcast_async(payload: PodcastRequest):
+    """Start podcast generation as a job and return without waiting for inference."""
+    language = _normalise_language(payload.language)
+    return _queue_podcast_job(payload, language)
+
+
+@app.get("/podcast-jobs/{job_id}")
+def get_podcast_job(job_id: str):
+    """Poll a queued/running podcast job or retrieve its completed result."""
+    with PODCAST_JOBS_LOCK:
+        _prune_podcast_jobs_locked()
+        job = PODCAST_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Podcast job not found or expired.")
+        snapshot = dict(job)
+    return _podcast_job_response(snapshot)
+
+
 @app.post("/generate-podcast")
 def generate_podcast(payload: PodcastRequest):
+    # Keep the original synchronous contract for existing app versions.
     language = _normalise_language(payload.language)
+    logger.info("Synchronous podcast request received (language=%s)", language)
     result = _generate_podcast(payload, language)
     return {"status": "success", "model": MODEL_NAME, **result}
 
