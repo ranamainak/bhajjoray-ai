@@ -274,9 +274,10 @@ def _podcast_system_prompt(language: str, reference: str) -> str:
     return (
         "You are the careful devotional podcast writer for the Bhajjoray app. "
         "Create a complete spoken podcast from the verified source material in "
-        "the user message. Follow the word-count requirement as the strict priority. "
-        f"Write between {minimum} and {maximum} whitespace-separated words, aiming "
-        f"for approximately {round((minimum + maximum) / 2)} words. "
+        "the user message. "
+        f"Aim for {target_minimum} to {target_maximum} whitespace-separated words. "
+        f"The absolute permitted range is {minimum} to {maximum} words; never exceed "
+        "that hard maximum. Prefer a concise script over filling the entire limit. "
         f"At about {wpm} spoken words per minute, this corresponds to approximately "
         f"{duration_guidance} of narration. Never add words just to lengthen the audio. "
         f"{language_instruction} "
