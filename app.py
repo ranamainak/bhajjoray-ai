@@ -217,9 +217,11 @@ def _is_gita_2_47(reference: str) -> bool:
 
 
 def _podcast_word_limits(language: str) -> tuple[int, int, int]:
-    """Hard acceptance limits and estimated speaking rate."""
+    """Acceptance limits derived from the intended 3–4 minute narration duration."""
     if language == "Hindi":
-        return 360, 420, 112
+        # At 112 words/minute, 336 words is exactly 3 minutes.
+        # Keep 420 as the conservative 3:45 upper bound.
+        return 336, 420, 112
     return 340, 400, 123
 
 
