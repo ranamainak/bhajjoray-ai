@@ -199,6 +199,12 @@ def _podcast_word_limits(language: str) -> tuple[int, int, int]:
 
 def _podcast_system_prompt(language: str, reference: str) -> str:
     minimum, maximum, wpm = _podcast_word_limits(language)
+    min_seconds = round(minimum / wpm * 60)
+    max_seconds = round(maximum / wpm * 60)
+    duration_guidance = (
+        f"{min_seconds // 60} minutes {min_seconds % 60:02d} seconds to "
+        f"{max_seconds // 60} minutes {max_seconds % 60:02d} seconds"
+    )
     if language == "Hindi":
         language_instruction = (
             "Write natural, grammatically correct spoken Hindi in Devanagari. "
@@ -234,9 +240,11 @@ def _podcast_system_prompt(language: str, reference: str) -> str:
     return (
         "You are the careful devotional podcast writer for the Bhajjoray app. "
         "Create a complete spoken podcast from the verified source material in "
-        "the user message. The script must be suitable for approximately 3 to 4 "
-        f"minutes at about {wpm} spoken words per minute. "
-        f"Write between {minimum} and {maximum} whitespace-separated words. "
+        "the user message. Follow the word-count requirement as the strict priority. "
+        f"Write between {minimum} and {maximum} whitespace-separated words, aiming "
+        f"for approximately {round((minimum + maximum) / 2)} words. "
+        f"At about {wpm} spoken words per minute, this corresponds to approximately "
+        f"{duration_guidance} of narration. Never add words just to lengthen the audio. "
         f"{language_instruction} "
         f"{verse_guidance} "
         "SOURCE FIDELITY: Treat the supplied Sanskrit, translation, and meaning as "
@@ -284,8 +292,10 @@ def _podcast_user_prompt(payload: PodcastSourceRequest, language: str) -> str:
         f"{translation}\n\n"
         "Verified meaning/explanation:\n"
         f"{payload.meaning}\n\n"
-        f"Write {minimum} to {maximum} words in {language}. Use exactly one everyday "
-        "example. Explain only what is supported by the supplied source. Do not "
+        f"Write {minimum} to {maximum} words in {language}, aiming for "
+        f"approximately {round((minimum + maximum) / 2)} words. This word-count "
+        "requirement is strict and takes priority over any preferred audio length. "
+        "Use exactly one everyday example. Explain only what is supported by the supplied source. Do not "
         "invent verse references, unsupported theology, or extra scriptural claims. "
         "Return complete, natural spoken narration only."
     )
@@ -366,8 +376,12 @@ def _podcast_quality_issues(
     if source_shloka and source_shloka in script_compact:
         issues.append("source_shloka_repeated_in_podcast")
 
-    if not (180 <= estimated_seconds <= 240):
-        issues.append(f"estimated_duration_outside_target_{estimated_seconds}_seconds")
+    minimum_seconds = round(minimum / wpm * 60)
+    maximum_seconds = round(maximum / wpm * 60)
+    if not (minimum_seconds <= estimated_seconds <= maximum_seconds):
+        issues.append(
+            f"estimated_duration_outside_word_count_range_{estimated_seconds}_seconds"
+        )
 
     return issues
 
@@ -386,6 +400,12 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
     issues: list[str] = []
     attempts = 0
     minimum, maximum, words_per_minute = _podcast_word_limits(language)
+    min_seconds = round(minimum / words_per_minute * 60)
+    max_seconds = round(maximum / words_per_minute * 60)
+    duration_guidance = (
+        f"{min_seconds // 60} minutes {min_seconds % 60:02d} seconds to "
+        f"{max_seconds // 60} minutes {max_seconds % 60:02d} seconds"
+    )
 
     for attempt in range(2):
         attempts = attempt + 1
@@ -403,7 +423,10 @@ def _generate_podcast(payload: PodcastSourceRequest, language: str) -> dict:
                 "Your previous draft failed these mechanical checks: "
                 + "; ".join(issues)
                 + f". Rewrite the COMPLETE narration, not an explanation of the errors. "
-                f"It must contain {minimum} to {maximum} words and take 3 to 4 minutes. "
+                f"It must contain strictly {minimum} to {maximum} words, aiming for "
+                f"approximately {round((minimum + maximum) / 2)} words. At the stated "
+                f"speaking rate this is approximately {duration_guidance}. The word-count "
+                "limit takes priority; do not add words to reach a longer duration. "
                 "Keep exactly one everyday example. Preserve the supplied source meaning. "
                 "Do not mention the numeric chapter/verse reference aloud. Do not repeat "
                 "the Sanskrit shloka. Use only the requested language and finish with a "
