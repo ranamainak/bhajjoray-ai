@@ -4,3 +4,5 @@ uvicorn
 pydantic
 huggingface_hub
 llama-cpp-python==0.3.36
+azure-storage-blob>=12.24,<13
+azure-storage-queue>=12.12,<13
