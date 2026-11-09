@@ -194,7 +194,7 @@ def _is_gita_2_47(reference: str) -> bool:
 def _podcast_word_limits(language: str) -> tuple[int, int, int]:
     if language == "Hindi":
         return 360, 420, 112
-    return 340, 380, 123
+    return 340, 400, 123
 
 
 def _podcast_system_prompt(language: str, reference: str) -> str:
