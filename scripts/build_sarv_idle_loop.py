@@ -1,8 +1,14 @@
-"""Build Sarv's seamless 15-second living idle loop video from sarv_master.png."""
+"""Build Sarv's seamless 15-second living idle loop video from sarv_master.png.
+
+Includes:
+- Layered wind sway on background banyan leaves, hanging aerial roots, and grass
+- Subtle breeze flutter on Sarv's loose temple hair & beard tips
+- Natural breathing, gentle meditative body sway, and periodic calm hand movement
+- Natural asymmetric eye blinks
+"""
 
 import os
 import subprocess
-import sys
 import numpy as np
 import cv2
 
@@ -23,13 +29,22 @@ def blink_amount(t: float) -> float:
     val = 0.0
     for bt in BLINK_TIMES:
         dt = t - bt
-        # Fast close (-0.08s..0s), slightly slower open (0s..+0.13s)
         if -0.08 <= dt <= 0.0:
             u = (dt + 0.08) / 0.08
             val = max(val, 0.5 - 0.5 * np.cos(np.pi * u))
         elif 0.0 < dt <= 0.13:
             u = 1.0 - (dt / 0.13)
             val = max(val, 0.5 - 0.5 * np.cos(np.pi * u))
+    return float(val)
+
+
+def hand_gesture_curve(t: float) -> float:
+    """Smooth periodic bell curve for gentle meditative hand/forearm movement."""
+    val = 0.0
+    for center, width in ((4.5, 1.8), (11.2, 1.9)):
+        dt = abs(t - center)
+        if dt < width:
+            val = max(val, 0.5 * (1.0 + np.cos(np.pi * dt / width)))
     return float(val)
 
 
@@ -48,22 +63,17 @@ def apply_eye_blink(frame: np.ndarray, amount: float, skin_color: np.ndarray) ->
         y1 = min(h, int(cy + ry + 4))
 
         patch = out[y0:y1, x0:x1].astype(np.float32)
-        ph, pw = patch.shape[:2]
+        ph = patch.shape[0]
         yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
 
-        # Elliptical eye mask
-        norm_x = (xx - cx) / rx
-        norm_y = (yy - cy) / ry
-        dist2 = norm_x ** 2 + norm_y ** 2
+        dist2 = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
         mask = np.clip(1.0 - dist2, 0.0, 1.0) ** 1.3
 
-        # Pull upper eyelid pixels downward over the eye opening
         eyelid_shift = amount * 6.5 * mask
         src_y = np.clip(yy - y0 - eyelid_shift, 0, ph - 1).astype(np.float32)
         src_x = (xx - x0).astype(np.float32)
         warped = cv2.remap(patch, src_x, src_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-        # Subtle eyelid crease darkening near lower lid line when closing
         lid_line = np.exp(-((yy - (cy + 1.5 * amount)) / 2.2) ** 2) * mask * amount
         blended = warped * (1.0 - 0.35 * amount * mask[..., None]) + skin_color[None, None, :] * (0.35 * amount * mask[..., None])
         blended = blended * (1.0 - 0.28 * lid_line[..., None])
@@ -74,67 +84,122 @@ def apply_eye_blink(frame: np.ndarray, amount: float, skin_color: np.ndarray) ->
     return out
 
 
+def build_sarv_masks(h: int, w: int):
+    """Build smooth spatial masks for Sarv's head, hair, torso, hands, and background foliage."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    nx = (xx - w * 0.5) / (w * 0.5)
+    ny = yy / h
+
+    # Head + upper shoulders silhouette
+    head_mask = np.exp(-(((xx - w * 0.501) / (w * 0.075)) ** 4 + ((yy - h * 0.34) / (h * 0.16)) ** 4))
+    # Torso + crossed legs silhouette
+    torso_mask = np.exp(-(((xx - w * 0.505) / (w * 0.165)) ** 4 + ((yy - h * 0.72) / (h * 0.34)) ** 4))
+    # Combined character body mask (protects Sarv from background wind waves)
+    body_mask = np.clip(np.maximum(head_mask, torso_mask), 0.0, 1.0)
+    body_mask = cv2.GaussianBlur(body_mask, (31, 31), 0)
+
+    # Loose temple hair & beard tips (breeze flutter without disturbing eyes/mouth)
+    left_temple = np.exp(-(((xx - 618.0) / 22.0) ** 2 + ((yy - 245.0) / 42.0) ** 2))
+    right_temple = np.exp(-(((xx - 758.0) / 22.0) ** 2 + ((yy - 245.0) / 42.0) ** 2))
+    beard_tip = np.exp(-(((xx - 688.0) / 38.0) ** 2 + ((yy - 368.0) / 24.0) ** 2))
+    hair_mask = np.clip(left_temple + right_temple + 0.7 * beard_tip, 0.0, 1.0)
+
+    # Breathing & gentle body sway weights
+    breath_weight = body_mask * np.clip(1.0 - (ny ** 2.4), 0.0, 1.0) * np.clip((ny - 0.12) / 0.22, 0.25, 1.0)
+    chest_weight = body_mask * np.exp(-((ny - 0.57) / 0.17) ** 2)
+    head_sway_weight = body_mask * np.exp(-((ny - 0.34) / 0.20) ** 2)
+
+    # Hands & forearms in lap (x ~ 530..820, y ~ 590..768)
+    hands_mask = np.exp(-(((xx - 675.0) / 115.0) ** 4 + ((yy - 695.0) / 72.0) ** 2)) * body_mask
+
+    # Background foliage / banyan roots / grass mask (strictly outside Sarv)
+    bg_mask = np.clip(1.0 - body_mask, 0.0, 1.0)
+    # Hanging roots & canopy sway stronger higher/mid-frame; grass ripples softly lower down
+    canopy_weight = bg_mask * np.clip(1.0 - np.abs(ny - 0.32) / 0.45, 0.25, 1.0)
+    grass_weight = bg_mask * np.clip((ny - 0.68) / 0.32, 0.0, 1.0)
+
+    # Subtle golden morning light shimmer in upper-right mist
+    sun_mask = (
+        np.clip((xx - w * 0.62) / (w * 0.25), 0.0, 1.0)
+        * np.clip(1.0 - ny / 0.75, 0.0, 1.0)
+        * bg_mask
+    )[..., None]
+
+    return {
+        "xx": xx,
+        "yy": yy,
+        "nx": nx,
+        "hair_mask": hair_mask,
+        "breath_weight": breath_weight,
+        "chest_weight": chest_weight,
+        "head_sway_weight": head_sway_weight,
+        "hands_mask": hands_mask,
+        "canopy_weight": canopy_weight,
+        "grass_weight": grass_weight,
+        "sun_mask": sun_mask,
+    }
+
+
 def build_idle_loop(master_path: str, out_path: str) -> None:
     img = cv2.imread(master_path)
     if img is None:
         raise FileNotFoundError(f"Could not read master image: {master_path}")
 
     h, w = img.shape[:2]
-
-    # Sample upper-eyelid skin tone just above right eye
     eyelid_patch = img[int(RIGHT_EYE[1] - 11):int(RIGHT_EYE[1] - 7), int(RIGHT_EYE[0] - 6):int(RIGHT_EYE[0] + 6)]
     skin_color = eyelid_patch.mean(axis=(0, 1)).astype(np.float32)
 
-    # Precompute spatial weights for seamless breathing + gentle sway
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    nx = (xx - w * 0.5) / (w * 0.5)  # -1..1
-    ny = yy / h                       # 0..1
-
-    # Character region mask: centered horizontally around Sarv (x ~ 0.25..0.75), anchored at bottom (ny=1)
-    char_horiz = np.exp(-((xx - w * 0.505) / (w * 0.22)) ** 4)
-    # Torso & head rise on inhale, hips stay planted on grass
-    breath_weight = char_horiz * np.clip(1.0 - (ny ** 2.2), 0.0, 1.0) * np.clip((ny - 0.12) / 0.25, 0.25, 1.0)
-    # Subtle chest expansion outward around chest/shoulders (y ~ 0.45..0.75)
-    chest_weight = char_horiz * np.exp(-((ny - 0.58) / 0.18) ** 2)
-    # Head micro-sway (y ~ 0.18..0.52)
-    head_weight = char_horiz * np.exp(-((ny - 0.34) / 0.20) ** 2)
-
-    # Subtle sunlit mist shimmer mask on upper-right background (away from Sarv's face)
-    sun_mask = (
-        np.clip((xx - w * 0.62) / (w * 0.25), 0.0, 1.0)
-        * np.clip(1.0 - ny / 0.75, 0.0, 1.0)
-        * (1.0 - char_horiz)
-    )[..., None]
+    m = build_sarv_masks(h, w)
+    xx, yy, nx = m["xx"], m["yy"], m["nx"]
 
     tmp_avi = out_path + ".tmp.mp4"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(tmp_avi, fourcc, FPS, (w, h))
+    writer = cv2.VideoWriter(tmp_avi, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (w, h))
 
     base_f = img.astype(np.float32)
 
     for i in range(NUM_FRAMES):
         t = i / FPS
-        # Exact periodic cycles over 15s so frame 375 matches frame 0
-        breath = np.sin(2.0 * np.pi * (t / 5.0))            # 3 breaths in 15s
-        sway = np.sin(2.0 * np.pi * (t / 15.0))             # 1 gentle sway in 15s
-        sun_pulse = 0.5 + 0.5 * np.sin(2.0 * np.pi * (t / 7.5))  # 2 soft light pulses in 15s
+        # Exact integer cycles over 15.0s for a 100% seamless loop
+        breath = np.sin(2.0 * np.pi * (t / 5.0))            # 3 breaths
+        body_sway = np.sin(2.0 * np.pi * (t / 15.0))        # 1 gentle posture sway
+        hand_lift = hand_gesture_curve(t)                   # 2 calm hand gestures
+        sun_pulse = 0.5 + 0.5 * np.sin(2.0 * np.pi * (t / 7.5))
 
-        # Map destination -> source coordinates
-        dy = -2.2 * breath * breath_weight
-        dx = (-1.6 * sway * head_weight) - (1.2 * breath * chest_weight * nx)
+        # Background breeze: traveling multi-frequency wind waves for leaves & hanging banyan roots
+        wind_x1 = np.sin(2.0 * np.pi * (t / 5.0) + yy * 0.012 + xx * 0.005)
+        wind_x2 = np.sin(2.0 * np.pi * (t / 3.0) - yy * 0.018 + xx * 0.008)
+        wind_y = np.cos(2.0 * np.pi * (t / 5.0) + xx * 0.009 + yy * 0.010)
+        grass_wave = np.sin(2.0 * np.pi * (t / 3.75) + xx * 0.022)
+
+        # Hair breeze ripple
+        hair_wave = np.sin(2.0 * np.pi * (t / 3.0) + yy * 0.05)
+
+        dx = (
+            (-2.8 * body_sway * m["head_sway_weight"])
+            - (1.6 * breath * m["chest_weight"] * nx)
+            + (2.2 * hair_wave * m["hair_mask"])
+            + ((3.6 * wind_x1 + 1.6 * wind_x2) * m["canopy_weight"])
+            + (2.4 * grass_wave * m["grass_weight"])
+            - (2.5 * hand_lift * m["hands_mask"] * nx)
+        )
+        dy = (
+            (-2.8 * breath * m["breath_weight"])
+            - (7.5 * hand_lift * m["hands_mask"])
+            + (0.7 * hair_wave * m["hair_mask"])
+            + (1.5 * wind_y * m["canopy_weight"])
+            + (0.8 * grass_wave * m["grass_weight"])
+        )
 
         map_x = np.clip(xx - dx, 0, w - 1).astype(np.float32)
         map_y = np.clip(yy - dy, 0, h - 1).astype(np.float32)
 
         warped = cv2.remap(base_f, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-        # Gentle early-morning golden shimmer on background mist
-        warmth = np.array([0.98, 1.01, 1.03], dtype=np.float32)  # BGR slight golden warmth
-        warped = warped * (1.0 + sun_mask * (0.035 * sun_pulse) * (warmth - 1.0 + 0.5))
+        warmth = np.array([0.98, 1.01, 1.03], dtype=np.float32)
+        warped = warped * (1.0 + m["sun_mask"] * (0.04 * sun_pulse) * (warmth - 1.0 + 0.5))
         frame = np.clip(warped, 0, 255).astype(np.uint8)
 
-        # Apply natural blink
         b_amt = blink_amount(t)
         if b_amt > 0.02:
             frame = apply_eye_blink(frame, b_amt, skin_color)
@@ -143,7 +208,6 @@ def build_idle_loop(master_path: str, out_path: str) -> None:
 
     writer.release()
 
-    # Re-encode to web/Wav2Lip-friendly H.264 YUV420p MP4 via FFmpeg
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", tmp_avi,

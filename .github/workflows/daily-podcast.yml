@@ -25,7 +25,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Generate Hindi & English scripts and upload to R2
+      - name: Generate Hindi script and upload to R2
         env:
           BHJ_API_BASE_URL: https://bhajjoray-ai-app.kinddesert-f3b90dc1.eastus.azurecontainerapps.io
           SHLOKA_REFERENCE: ${{ github.event.inputs.shloka_reference }}
@@ -35,7 +35,7 @@ jobs:
         run: |
           pip install --no-cache-dir edge-tts piper-tts onnxruntime opencv-python-headless numpy scipy boto3
 
-      - name: Generate Hindi & English Sarv lip-sync videos and upload to R2
+      - name: Generate Hindi Sarv lip-sync video and upload to R2
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}

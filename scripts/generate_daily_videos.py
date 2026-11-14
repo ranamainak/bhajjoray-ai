@@ -243,7 +243,7 @@ def build_mel_chunks(mel: np.ndarray, fps: int = FPS) -> List[np.ndarray]:
 
 def load_idle_frames_and_boxes(
     idle_video_path: Path, yunet_path: Path
-) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int]]]:
+) -> Tuple[List[np.ndarray], List[Tuple[int, int, int, int, float, float, float]]]:
     cap = cv2.VideoCapture(str(idle_video_path))
     frames: List[np.ndarray] = []
     while True:
@@ -258,18 +258,25 @@ def load_idle_frames_and_boxes(
     h, w = frames[0].shape[:2]
     detector = cv2.FaceDetectorYN.create(str(yunet_path), "", (w, h), 0.6, 0.3, 5000)
 
-    raw_boxes: List[Tuple[int, int, int, int]] = []
-    last_box: Optional[Tuple[int, int, int, int]] = None
+    raw_boxes: List[Tuple[int, int, int, int, float, float, float]] = []
+    last_box: Optional[Tuple[int, int, int, int, float, float, float]] = None
     for frame in frames:
         _, faces = detector.detect(frame)
         if faces is not None and len(faces) > 0:
-            x, y, bw, bh = faces[0][:4]
-            # Pad slightly for Wav2Lip (include chin/beard cleanly)
+            f0 = faces[0]
+            x, y, bw, bh = f0[:4]
+            # Mouth corner landmarks from YuNet
+            mrx, mry, mlx, mly = float(f0[10]), float(f0[11]), float(f0[12]), float(f0[13])
+            mx = 0.5 * (mrx + mlx)
+            my = 0.5 * (mry + mly)
+            mw = max(20.0, abs(mlx - mrx))
+
+            # Pad slightly for Wav2Lip
             y1 = max(0, int(y - 0.05 * bh))
-            y2 = min(h, int(y + 1.12 * bh))
+            y2 = min(h, int(y + 1.10 * bh))
             x1 = max(0, int(x - 0.08 * bw))
             x2 = min(w, int(x + 1.08 * bw))
-            box = (x1, y1, x2, y2)
+            box = (x1, y1, x2, y2, mx, my, mw)
             last_box = box
         elif last_box is not None:
             box = last_box
@@ -277,39 +284,46 @@ def load_idle_frames_and_boxes(
             raise RuntimeError("No face detected in idle loop frame.")
         raw_boxes.append(box)
 
-    # Smooth boxes slightly across circular 15s boundary
+    # Smooth boxes & mouth landmarks across circular 15s boundary
     n = len(raw_boxes)
-    smoothed: List[Tuple[int, int, int, int]] = []
+    smoothed: List[Tuple[int, int, int, int, float, float, float]] = []
     for i in range(n):
         idxs = [(i + d) % n for d in (-2, -1, 0, 1, 2)]
         xs1 = int(round(sum(raw_boxes[j][0] for j in idxs) / 5))
         ys1 = int(round(sum(raw_boxes[j][1] for j in idxs) / 5))
         xs2 = int(round(sum(raw_boxes[j][2] for j in idxs) / 5))
         ys2 = int(round(sum(raw_boxes[j][3] for j in idxs) / 5))
-        smoothed.append((xs1, ys1, xs2, ys2))
+        mxs = sum(raw_boxes[j][4] for j in idxs) / 5.0
+        mys = sum(raw_boxes[j][5] for j in idxs) / 5.0
+        mws = sum(raw_boxes[j][6] for j in idxs) / 5.0
+        smoothed.append((xs1, ys1, xs2, ys2, mxs, mys, mws))
 
     return frames, smoothed
 
 
-def build_mouth_feather_mask(box_w: int, box_h: int) -> np.ndarray:
-    """Soft elliptical mask covering only the mouth & immediate beard/mustache for crisp blending."""
-    mask = np.zeros((box_h, box_w), dtype=np.float32)
-    cx = box_w * 0.50
-    cy = box_h * 0.69
-    rx = box_w * 0.28
-    ry = box_h * 0.16
+def build_mouth_feather_mask(
+    box_w: int, box_h: int, rel_mx: float, rel_my: float, rel_mw: float
+) -> np.ndarray:
+    """Tight elliptical mask centered strictly on the lips so lower beard hair stays crisp and still."""
+    cx = rel_mx
+    cy = rel_my
+    rx = max(12.0, rel_mw * 0.56)
+    ry = max(7.0, rel_mw * 0.22)
     yy, xx = np.mgrid[0:box_h, 0:box_w].astype(np.float32)
     dist = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
-    mask = np.clip(1.0 - dist, 0.0, 1.0) ** 1.6
-    # Keep upper half strictly 0 so eyes/nose stay 100% HD original
-    mask[: int(box_h * 0.52), :] = 0.0
-    mask = cv2.GaussianBlur(mask, (11, 11), 0)
+    mask = np.clip(1.0 - dist, 0.0, 1.0) ** 1.5
+    # Hard cutoff above upper lip and below lower lip so beard hair beneath never wobbles
+    y_min = max(0, int(cy - ry * 1.05))
+    y_max = min(box_h, int(cy + ry * 1.05))
+    mask[:y_min, :] = 0.0
+    mask[y_max:, :] = 0.0
+    mask = cv2.GaussianBlur(mask, (7, 7), 0)
     return mask[..., None]
 
 
 def render_lipsync_video(
     idle_frames: List[np.ndarray],
-    idle_boxes: List[Tuple[int, int, int, int]],
+    idle_boxes: List[Tuple[int, int, int, int, float, float, float]],
     wav_16k_path: str,
     audio_mp3_path: str,
     wav2lip_session: ort.InferenceSession,
@@ -334,7 +348,7 @@ def render_lipsync_video(
     input_mel_name = "mel"
     output_name = wav2lip_session.get_outputs()[0].name
 
-    mask_cache: Dict[Tuple[int, int], np.ndarray] = {}
+    mask_cache: Dict[Tuple[int, int, int, int, int], np.ndarray] = {}
 
     for start in range(0, total_frames, batch_size):
         end = min(start + batch_size, total_frames)
@@ -342,13 +356,13 @@ def render_lipsync_video(
 
         img_batch = np.zeros((cur_bs, 6, WAV2LIP_IMG_SIZE, WAV2LIP_IMG_SIZE), dtype=np.float32)
         mel_batch = np.zeros((cur_bs, 1, 80, MEL_STEP_SIZE), dtype=np.float32)
-        coords_batch: List[Tuple[int, int, int, int]] = []
+        coords_batch: List[Tuple[int, int, int, int, float, float, float]] = []
         base_frames: List[np.ndarray] = []
 
         for b_idx, f_idx in enumerate(range(start, end)):
             idle_idx = f_idx % n_idle
             frame = idle_frames[idle_idx].copy()
-            x1, y1, x2, y2 = idle_boxes[idle_idx]
+            x1, y1, x2, y2, mx, my, mw = idle_boxes[idle_idx]
             face = frame[y1:y2, x1:x2]
             face_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
             face_96 = cv2.resize(face_rgb, (WAV2LIP_IMG_SIZE, WAV2LIP_IMG_SIZE)).astype(np.float32) / 255.0
@@ -360,7 +374,7 @@ def render_lipsync_video(
             combined = np.concatenate([masked, face_96], axis=2).transpose(2, 0, 1)
             img_batch[b_idx] = combined
             mel_batch[b_idx, 0] = mel_chunks[f_idx]
-            coords_batch.append((x1, y1, x2, y2))
+            coords_batch.append((x1, y1, x2, y2, mx, my, mw))
             base_frames.append(frame)
 
         preds = wav2lip_session.run(
@@ -371,18 +385,22 @@ def render_lipsync_video(
         for b_idx in range(cur_bs):
             pred_rgb = np.clip(preds[b_idx].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
             pred = cv2.cvtColor(pred_rgb, cv2.COLOR_RGB2BGR)
-            x1, y1, x2, y2 = coords_batch[b_idx]
+            x1, y1, x2, y2, mx, my, mw = coords_batch[b_idx]
             bw, bh = x2 - x1, y2 - y1
-            pred_resized = cv2.resize(pred, (bw, bh), interpolation=cv2.INTER_CUBIC)
+            pred_resized = cv2.resize(pred, (bw, bh), interpolation=cv2.INTER_CUBIC).astype(np.float32)
+            # Gentle unsharp mask to keep lips crisp
+            blur = cv2.GaussianBlur(pred_resized, (0, 0), 1.2)
+            pred_sharp = np.clip(pred_resized * 1.25 - blur * 0.25, 0, 255)
 
-            key = (bw, bh)
+            rel_mx, rel_my = mx - x1, my - y1
+            key = (bw, bh, int(round(rel_mx)), int(round(rel_my)), int(round(mw)))
             if key not in mask_cache:
-                mask_cache[key] = build_mouth_feather_mask(bw, bh)
+                mask_cache[key] = build_mouth_feather_mask(bw, bh, rel_mx, rel_my, mw)
             alpha = mask_cache[key]
 
             frame = base_frames[b_idx]
             orig_roi = frame[y1:y2, x1:x2].astype(np.float32)
-            blended = orig_roi * (1.0 - alpha) + pred_resized.astype(np.float32) * alpha
+            blended = orig_roi * (1.0 - alpha) + pred_sharp * alpha
             frame[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
             writer.write(frame)
 
@@ -409,7 +427,7 @@ def render_lipsync_video(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate daily Sarv lip-synced videos.")
     parser.add_argument("--date", default=ist_today(), help="Date YYYY-MM-DD (default: IST today)")
-    parser.add_argument("--langs", default="hi,en", help="Comma-separated languages (hi,en)")
+    parser.add_argument("--langs", default="hi", help="Comma-separated languages (default: hi)")
     parser.add_argument("--scripts-dir", default="", help="Optional local folder with script_hi.json / script_en.json")
     parser.add_argument("--out-dir", default="", help="Optional local output directory for generated videos")
     parser.add_argument("--skip-upload", action="store_true", help="Skip uploading videos to R2")

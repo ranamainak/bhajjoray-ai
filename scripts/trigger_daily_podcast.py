@@ -1,4 +1,4 @@
-"""Trigger daily Hindi and English podcast script generation on Azure Container Apps."""
+"""Trigger daily Hindi podcast script generation on Azure Container Apps."""
 
 import argparse
 import datetime as dt
@@ -100,7 +100,6 @@ def main() -> int:
 
     wait_for_health(base_url)
     generate_one(base_url, verse, "Hindi")
-    generate_one(base_url, verse, "English")
     return 0
 
 
