@@ -67,7 +67,8 @@ def publish_youtube_shorts(video_path: Path, title: str, description: str) -> st
         },
         timeout=30,
     )
-    token_resp.raise_for_status()
+    if not token_resp.ok:
+        raise RuntimeError(f"YouTube OAuth token error ({token_resp.status_code}): {token_resp.text}")
     access_token = token_resp.json()["access_token"]
 
     metadata = {
