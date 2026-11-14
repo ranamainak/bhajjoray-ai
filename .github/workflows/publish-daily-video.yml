@@ -1,0 +1,56 @@
+name: Publish Daily Video to Social Platforms
+
+on:
+  schedule:
+    # 23:30 UTC = 05:00 AM IST daily
+    - cron: '30 23 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Optional IST date override (YYYY-MM-DD)'
+        required: false
+        default: ''
+      platforms:
+        description: 'Comma-separated platforms (youtube,instagram,facebook)'
+        required: false
+        default: 'youtube,instagram,facebook'
+
+jobs:
+  publish-daily-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir boto3 requests
+
+      - name: Publish Hindi video from R2 to YouTube Shorts, Instagram Reels & Facebook
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          DATE_OVERRIDE: ${{ github.event.inputs.date }}
+          PLATFORMS: ${{ github.event.inputs.platforms }}
+        run: |
+          ARGS=""
+          if [ -n "$DATE_OVERRIDE" ]; then
+            ARGS="$ARGS --date $DATE_OVERRIDE"
+          fi
+          if [ -n "$PLATFORMS" ]; then
+            ARGS="$ARGS --platforms $PLATFORMS"
+          fi
+          python scripts/publish_daily_video.py $ARGS

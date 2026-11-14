@@ -2,8 +2,8 @@ name: Daily Podcast Generation
 
 on:
   schedule:
-    # 00:30 UTC = 06:00 AM IST daily
-    - cron: '30 0 * * *'
+    # 18:34 UTC = 12:04 AM IST daily
+    - cron: '34 18 * * *'
   workflow_dispatch:
     inputs:
       shloka_reference:
