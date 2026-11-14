@@ -262,8 +262,9 @@ def load_idle_frames_and_boxes(
     last_box: Optional[Tuple[int, int, int, int, float, float, float]] = None
     for frame in frames:
         _, faces = detector.detect(frame)
-        if faces is not None and len(faces) > 0:
-            f0 = faces[0]
+        valid_faces = [f for f in (faces if faces is not None else []) if f[1] < h * 0.65]
+        if valid_faces:
+            f0 = valid_faces[0]
             x, y, bw, bh = f0[:4]
             # Mouth corner landmarks from YuNet
             mrx, mry, mlx, mly = float(f0[10]), float(f0[11]), float(f0[12]), float(f0[13])
@@ -360,7 +361,10 @@ def render_lipsync_video(
         base_frames: List[np.ndarray] = []
 
         for b_idx, f_idx in enumerate(range(start, end)):
-            idle_idx = f_idx % n_idle
+            # Ping-pong loop (0..N-1..1..0) so non-seamless clips never jump-cut
+            cycle = max(1, 2 * n_idle - 2)
+            pos = f_idx % cycle
+            idle_idx = pos if pos < n_idle else (cycle - pos)
             frame = idle_frames[idle_idx].copy()
             x1, y1, x2, y2, mx, my, mw = idle_boxes[idle_idx]
             face = frame[y1:y2, x1:x2]
