@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+models/wav2lip.onnx
+models/piper/
+generated_videos/
