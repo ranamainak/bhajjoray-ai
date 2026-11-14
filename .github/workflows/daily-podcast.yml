@@ -1,0 +1,32 @@
+name: Daily Podcast Generation
+
+on:
+  schedule:
+    # 00:30 UTC = 06:00 AM IST daily
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+    inputs:
+      shloka_reference:
+        description: 'Optional verse override (e.g. 2.47 or Bhagavad Gita 2.47)'
+        required: false
+        default: ''
+
+jobs:
+  generate-daily-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Hindi & English scripts and upload to R2
+        env:
+          BHJ_API_BASE_URL: https://bhajjoray-ai-app.kinddesert-f3b90dc1.eastus.azurecontainerapps.io
+          SHLOKA_REFERENCE: ${{ github.event.inputs.shloka_reference }}
+        run: python scripts/trigger_daily_podcast.py

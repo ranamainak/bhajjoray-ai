@@ -675,11 +675,14 @@ def generate_daily_podcasts(payload: PodcastSourceRequest):
     # Hindi then English, sequentially, using the same model instance.
     logger.info("podcast_request_started endpoint=generate-daily-podcasts languages=Hindi,English")
     hindi = _generate_podcast(payload, "Hindi")
+    r2_hindi = _save_script_to_r2(hindi)
     english = _generate_podcast(payload, "English")
-    logger.info("podcast_request_completed endpoint=generate-daily-podcasts")
+    r2_english = _save_script_to_r2(english)
+    logger.info("podcast_request_completed endpoint=generate-daily-podcasts r2_upload=success")
     return {
         "status": "success",
         "model": MODEL_NAME,
         "shloka_reference": payload.shloka_reference,
         "scripts": {"Hindi": hindi, "English": english},
+        "r2_uploads": {"Hindi": r2_hindi, "English": r2_english},
     }
